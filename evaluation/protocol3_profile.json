@@ -1,0 +1,184 @@
+{
+  "schema": "webretriever.protocol3.profile/v1",
+  "task_count": 100,
+  "dataset_sha256": "8f739b5cc4ed2323ee979ca3fa16df5763a6a1baea2ff97b28dabea209019e49",
+  "required_fields": [
+    "task_idx",
+    "task_id",
+    "website",
+    "task",
+    "answer"
+  ],
+  "field_profile": {
+    "answer": {
+      "present": 100,
+      "missing": 0,
+      "null": 0,
+      "empty_string": 0,
+      "types": {
+        "string": 100
+      }
+    },
+    "task": {
+      "present": 100,
+      "missing": 0,
+      "null": 0,
+      "empty_string": 0,
+      "types": {
+        "string": 100
+      }
+    },
+    "task_id": {
+      "present": 100,
+      "missing": 0,
+      "null": 0,
+      "empty_string": 0,
+      "types": {
+        "string": 100
+      }
+    },
+    "task_idx": {
+      "present": 100,
+      "missing": 0,
+      "null": 0,
+      "empty_string": 0,
+      "types": {
+        "number": 100
+      }
+    },
+    "website": {
+      "present": 100,
+      "missing": 0,
+      "null": 0,
+      "empty_string": 0,
+      "types": {
+        "string": 100
+      }
+    }
+  },
+  "unique_websites": 98,
+  "unique_hosts": 97,
+  "website_counts": {
+    "https://acl.gov/": 1,
+    "https://atlas.hks.harvard.edu/": 1,
+    "https://b.faloo.com/": 1,
+    "https://boardgamegeek.com/": 1,
+    "https://catalog.mit.edu/": 1,
+    "https://climatetrace.org/": 1,
+    "https://clinicaltrials.gov/": 1,
+    "https://cn.silabs.com": 1,
+    "https://ctrchina.cn": 1,
+    "https://cwur.org": 1,
+    "https://data-explorer.oecd.org/": 1,
+    "https://data.bls.gov/": 1,
+    "https://data.cityofchicago.org/": 1,
+    "https://data.cityofnewyork.us/": 1,
+    "https://data.cityofsydney.nsw.gov.au": 1,
+    "https://data.gov.hk": 1,
+    "https://data.stats.gov.cn": 1,
+    "https://data.worldbank.org/": 1,
+    "https://dot.ca.gov/": 1,
+    "https://earthquake.usgs.gov/": 1,
+    "https://ec.europa.eu/eurostat/web/main/home": 1,
+    "https://edgar.jrc.ec.europa.eu/": 1,
+    "https://exoplanetarchive.ipac.caltech.edu/": 1,
+    "https://fanqienovel.com/": 1,
+    "https://fpma.fao.org/giews/fpmat4/": 1,
+    "https://fragilestatesindex.org/": 1,
+    "https://globalcarbonatlas.org/": 1,
+    "https://gs.statcounter.com/": 1,
+    "https://iiag.online/": 1,
+    "https://ilostat.ilo.org/": 1,
+    "https://kof.ethz.ch/en/": 1,
+    "https://kpl.qq.com/#/": 1,
+    "https://lpl.qq.com/": 1,
+    "https://mi.talkingdata.com": 1,
+    "https://openalex.org/": 1,
+    "https://ourworldindata.org": 1,
+    "https://pageviews.wmcloud.org/": 1,
+    "https://piaofang.maoyan.com": 2,
+    "https://pubmed.ncbi.nlm.nih.gov/": 1,
+    "https://pvp.qq.com/": 1,
+    "https://sam.gov/": 1,
+    "https://seer.cancer.gov/": 1,
+    "https://statistics.jnto.go.jp/en/": 1,
+    "https://tjj.sc.gov.cn": 1,
+    "https://tradingeconomics.com/": 1,
+    "https://travel.state.gov/content/travel.html": 1,
+    "https://v-dem.net/": 1,
+    "https://wid.world/": 1,
+    "https://www.americashealthrankings.org/": 1,
+    "https://www.askci.com/": 1,
+    "https://www.canadapost-postescanada.ca/cpc/en/home.page?name=tgt#": 1,
+    "https://www.cbndata.com/": 1,
+    "https://www.cbre.com/": 1,
+    "https://www.citi.com/": 1,
+    "https://www.cninfo.com.cn/new/index": 1,
+    "https://www.cs.toronto.edu": 1,
+    "https://www.cso.ie": 1,
+    "https://www.datayicai.com/": 1,
+    "https://www.deloitte.com": 1,
+    "https://www.discogs.com/": 1,
+    "https://www.drugfuture.com": 1,
+    "https://www.drugs.com/": 1,
+    "https://www.eia.gov/": 1,
+    "https://www.fao.org/faostat/en/#home": 1,
+    "https://www.fda.gov": 1,
+    "https://www.footprintnetwork.org/": 1,
+    "https://www.gbif.org/": 1,
+    "https://www.globalforestwatch.org/": 1,
+    "https://www.heritage.org/": 1,
+    "https://www.hkexnews.hk/": 1,
+    "https://www.iata.org/": 1,
+    "https://www.imdb.com/": 1,
+    "https://www.loc.gov/": 1,
+    "https://www.ncss.cn/": 1,
+    "https://www.nhc.gov.cn/": 1,
+    "https://www.nmpa.gov.cn/datasearch/home-index.html#category=yp": 1,
+    "https://www.ntsb.gov/Pages/home.aspx": 1,
+    "https://www.pewresearch.org": 1,
+    "https://www.pwc.com/gx/en.html": 1,
+    "https://www.qianzhan.com/": 1,
+    "https://www.qidian.com": 1,
+    "https://www.questmobile.com.cn/": 1,
+    "https://www.rand.org": 1,
+    "https://www.royalmail.com/": 1,
+    "https://www.sec.gov": 2,
+    "https://www.sec.gov/": 1,
+    "https://www.sf.gov/departments--department-building-inspection": 1,
+    "https://www.shanghairanking.cn": 1,
+    "https://www.ssa.gov/": 1,
+    "https://www.ssb.no/en": 1,
+    "https://www.szse.cn/index/index.html": 1,
+    "https://www.thepaper.cn/": 1,
+    "https://www.topklout.com/#/home": 1,
+    "https://www.transtats.bts.gov": 1,
+    "https://www.usaspending.gov/": 1,
+    "https://www.yidaiyilu.gov.cn/": 1,
+    "https://www.zgdypw.cn": 1,
+    "https://www.zongheng.com/": 1
+  },
+  "task_type_counts": {
+    "analytical": 72,
+    "exhaustive": 15,
+    "lookup": 13
+  },
+  "answer_shape_counts": {
+    "multiline": 23,
+    "scalar": 77
+  },
+  "stratum_counts": {
+    "analytical:multiline": 10,
+    "analytical:scalar": 62,
+    "exhaustive:multiline": 11,
+    "exhaustive:scalar": 4,
+    "lookup:multiline": 2,
+    "lookup:scalar": 11
+  },
+  "answer_length": {
+    "min": 1,
+    "max": 426,
+    "mean": 28.11,
+    "median": 7.0
+  }
+}

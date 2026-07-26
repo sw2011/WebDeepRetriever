@@ -1,0 +1,32 @@
+services:
+  web-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: webdeepretriever:protocol3
+    init: true
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?请在 .env 中设置 OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      WEBRETRIEVER_MODEL: ${WEBRETRIEVER_MODEL:-gpt-4.1-mini}
+      WEBRETRIEVER_CDP_URLS: ${WEBRETRIEVER_CDP_URLS:?请设置一个到八个逗号分隔的外部 CDP URL}
+      WEBRETRIEVER_MAX_STEPS: ${WEBRETRIEVER_MAX_STEPS:-100}
+      WEBRETRIEVER_UPLOAD_ROOTS: /work/input
+    volumes:
+      - type: bind
+        source: ${WEBRETRIEVER_INPUT_HOST:?请设置宿主机任务 JSON 路径}
+        target: /work/input/tasks.json
+        read_only: true
+      - type: bind
+        source: ${WEBRETRIEVER_OUTPUT_HOST:-./output}
+        target: /work/output
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["--input", "/work/input/tasks.json", "--output", "/work/output"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "web_agent.cli", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: "no"

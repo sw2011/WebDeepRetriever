@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "webdeepretriever"
+version = "0.1.0"
+description = "Protocol III web agent using Playwright CDP and verified evidence"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5,<7",
+  "numpy>=1.26,<3",
+  "openai>=2.8,<3",
+  "openai-agents==0.18.3",
+  "pillow>=10,<13",
+  "playwright>=1.49,<2",
+  "pydantic>=2.10,<3",
+  "pypdf>=5,<7",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "pytest-timeout>=2.3,<3",
+]
+
+[project.scripts]
+webdeepretriever = "web_agent.cli:main"
+webdeepretriever-eval = "web_agent.protocol3_eval:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web_agent", "vendor/browsergym/src/browsergym"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "webdeepretriever_licenses/THIRD_PARTY_NOTICES.md"
+"vendor/browsergym/LICENSE" = "webdeepretriever_licenses/browsergym/LICENSE"
+"vendor/browsergym/SOURCE.md" = "webdeepretriever_licenses/browsergym/SOURCE.md"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "integration: requires a local Chrome process exposed through CDP",
+]

@@ -1,0 +1,58 @@
+[
+  {
+    "task_idx": 5,
+    "task_id": "77e8632194d04f4a892f7199be925653",
+    "website": "https://data.gov.hk",
+    "task": "2010年到2025年间经香港机场来港的过境人次最高的前三个季度是哪三个",
+    "answer": "2011年第一季度172千人次\n2010年第三季度154千人次\n2011年第三季度151千人次"
+  },
+  {
+    "task_idx": 17,
+    "task_id": "eeb5049e10c5416c9c83a730fa850dd1",
+    "website": "https://www.shanghairanking.cn",
+    "task": "查看2024年软科中国大学哲学（专业编号：010101）专业在上海市排名前3的学校是哪些。",
+    "answer": "第一名：复旦大学\n第二名：华东师范大学\n第三名：同济大学"
+  },
+  {
+    "task_idx": 25,
+    "task_id": "811ccd25b9754ee1990f264f79c2fc9e",
+    "website": "https://www.ncss.cn/",
+    "task": "国家大学生就业服务平台放出的升学就业月历中，2026年2月几个重点事件名称是什么？",
+    "answer": "考研\n求职\n入伍"
+  },
+  {
+    "task_idx": 37,
+    "task_id": "ff93022b2eea467fbde813744775c743",
+    "website": "https://www.sec.gov/",
+    "task": "查询SEC EDGAR数据库中，NVIDIA公司首次提交10-K年报的日期",
+    "answer": "1999-04-29 00:00:00"
+  },
+  {
+    "task_idx": 40,
+    "task_id": "b5e170701d5540859d7d9ef8c2ce7ca3",
+    "website": "https://earthquake.usgs.gov/",
+    "task": "查询USGS地震数据库2025年1月发生的6级及以上地震总数。",
+    "answer": "7"
+  },
+  {
+    "task_idx": 63,
+    "task_id": "2dd800c4249f4a46978e250ea6ed9ad2",
+    "website": "https://wid.world/",
+    "task": "在WID中选择Country=Mongolia、Indicator=Top 10% income share、Year=2010,图表上hover显示的值是多少(%)?",
+    "answer": "0.437"
+  },
+  {
+    "task_idx": 68,
+    "task_id": "41491a22df3240e18117e07979ae35dd",
+    "website": "https://pageviews.wmcloud.org/",
+    "task": "在Wikimedia Pageviews Analysis中,输入Article=Eli Manning (en.wikipedia)、Date range=2024-02-01 to 2024-02-29,当月总浏览量是多少?",
+    "answer": "210007"
+  },
+  {
+    "task_idx": 75,
+    "task_id": "eb31f40363d94ba08d6b361c5f100c25",
+    "website": "https://gs.statcounter.com/",
+    "task": "在Statcounter GlobalStats中,选择Stat=Browser Market Share、Region=Vietnam、Period=Jan 2023 to Dec 2023 (Monthly),在折线图中找到Chrome在2023年6月的数据点,市场份额是多少(%)?",
+    "answer": "0.6351"
+  }
+]

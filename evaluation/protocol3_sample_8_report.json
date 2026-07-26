@@ -1,0 +1,26 @@
+{
+  "schema": "webretriever.protocol3.sample/v1",
+  "source_count": 100,
+  "sample_count": 8,
+  "seed": 20260726,
+  "source_sha256": "8f739b5cc4ed2323ee979ca3fa16df5763a6a1baea2ff97b28dabea209019e49",
+  "sample_sha256": "3f13bbd87057340f853743ca5057f0f866055e3cd477bb1cf8711365684aa1fe",
+  "allocation": {
+    "analytical:multiline": 1,
+    "analytical:scalar": 3,
+    "exhaustive:multiline": 1,
+    "exhaustive:scalar": 1,
+    "lookup:multiline": 1,
+    "lookup:scalar": 1
+  },
+  "task_ids": [
+    "77e8632194d04f4a892f7199be925653",
+    "eeb5049e10c5416c9c83a730fa850dd1",
+    "811ccd25b9754ee1990f264f79c2fc9e",
+    "ff93022b2eea467fbde813744775c743",
+    "b5e170701d5540859d7d9ef8c2ce7ca3",
+    "2dd800c4249f4a46978e250ea6ed9ad2",
+    "41491a22df3240e18117e07979ae35dd",
+    "eb31f40363d94ba08d6b361c5f100c25"
+  ]
+}

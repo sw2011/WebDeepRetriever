@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.local
+.venv/
+.pytest_cache/
+
+# Runtime artifacts
+output/
+test_results/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
