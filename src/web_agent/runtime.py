@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .browser_actor import BrowserActor
 from .contracts import ActionReceipt, CoverageCertificate, TaskContract
 from .evidence import EvidenceStore
+from .sanitization import redact_value, sanitize_exception
 from .verifier import CompletionVerifier
 
 
@@ -148,7 +149,9 @@ class TaskRuntimeContext:
         if self.tool_steps >= self.contract.max_steps:
             raise RuntimeError(f"STEP_LIMIT: 工具调用不得超过 {self.contract.max_steps} 步")
         self.tool_steps += 1
-        self.actions.append({"step": self.tool_steps, "tool": name, "arguments": arguments})
+        self.actions.append(
+            {"step": self.tool_steps, "tool": name, "arguments": redact_value(arguments)}
+        )
 
     def record_receipt(self, result: dict[str, Any]) -> None:
         self.receipts.append(
@@ -187,7 +190,7 @@ def _json(value: Any, limit: int = 140_000) -> str:
 
 
 def _error(name: str, exc: Exception) -> str:
-    return _json({"ok": False, "tool": name, "error": f"{type(exc).__name__}: {exc}"})
+    return _json({"ok": False, "tool": name, "error": sanitize_exception(exc)})
 
 
 async def _receipt_tool(
@@ -232,7 +235,14 @@ async def click(ctx: RunContextWrapper[TaskRuntimeContext], bid: str) -> str:
 @function_tool(timeout=12.0)
 async def fill(ctx: RunContextWrapper[TaskRuntimeContext], bid: str, value: str) -> str:
     """使用 Locator.fill 填写原生输入，并回读 value。"""
-    return await _receipt_tool(ctx, "fill", {"bid": bid, "value": value}, ctx.context.actor.fill(bid, value))
+    observed = ctx.context.latest_elements.get(bid, {})
+    recorded_value = "[REDACTED]" if str(observed.get("type", "")).casefold() == "password" else value
+    return await _receipt_tool(
+        ctx,
+        "fill",
+        {"bid": bid, "value": recorded_value},
+        ctx.context.actor.fill(bid, value),
+    )
 
 
 @function_tool(timeout=12.0)
@@ -487,6 +497,7 @@ async def visual_inspect(ctx: RunContextWrapper[TaskRuntimeContext], bid: str, q
                 }
             ],
             max_tokens=600,
+            **_kimi_request_options(ctx.context.vision_model),
         )
         analysis = response.choices[0].message.content or ""
         evidence = ctx.context.evidence_store.add(
@@ -525,6 +536,7 @@ async def visual_document(
                 }
             ],
             max_tokens=600,
+            **_kimi_request_options(ctx.context.vision_model),
         )
         analysis = response.choices[0].message.content or ""
         evidence = ctx.context.evidence_store.add(
@@ -643,6 +655,25 @@ TOOLS = [
 ]
 
 
+def _model_settings(model: str) -> ModelSettings:
+    settings: dict[str, Any] = {
+        "tool_choice": "required",
+        "parallel_tool_calls": False,
+        "temperature": 0,
+    }
+    settings.update(_kimi_request_options(model))
+    return ModelSettings(**settings)
+
+
+def _kimi_request_options(model: str) -> dict[str, Any]:
+    if model.strip().lower().rsplit("/", 1)[-1] != "kimi-k2.6":
+        return {}
+    return {
+        "temperature": 0.6,
+        "extra_body": {"thinking": {"type": "disabled"}},
+    }
+
+
 class ProtocolIIIAgent:
     def __init__(self, model: str, api_base: str, api_key: str, *, timeout_seconds: float = 180.0) -> None:
         self.model_name = model
@@ -658,11 +689,7 @@ class ProtocolIIIAgent:
             instructions=SYSTEM_INSTRUCTIONS,
             model=chat_model,
             tools=TOOLS,
-            model_settings=ModelSettings(
-                tool_choice="required",
-                parallel_tool_calls=False,
-                temperature=0,
-            ),
+            model_settings=_model_settings(model),
             tool_use_behavior=_verified_finish_behavior,
             reset_tool_choice=False,
         )
@@ -702,7 +729,7 @@ class ProtocolIIIAgent:
             error = f"达到 Protocol III 最大步数 {contract.max_steps}，且没有通过验证的 finish"
         except Exception as exc:
             status = "FAIL_AGENT_ERROR"
-            error = f"{type(exc).__name__}: {exc}"
+            error = sanitize_exception(exc)
         return {
             "status": status,
             "agent_answer": context.final_answer if status == "SUCCESS" else None,

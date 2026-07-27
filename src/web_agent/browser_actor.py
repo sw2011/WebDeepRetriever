@@ -20,6 +20,7 @@ from pypdf import PdfReader
 
 from .contracts import ActionReceipt
 from .evidence import EvidenceStore
+from .sanitization import SENSITIVE_FIELD, redact_text, redact_value, sanitize_exception, sanitize_url
 
 _VENDORED_BROWSERGYM = Path(__file__).resolve().parents[2] / "vendor" / "browsergym" / "src"
 if str(_VENDORED_BROWSERGYM) not in sys.path:
@@ -36,7 +37,6 @@ from browsergym.core.observation import (  # noqa: E402
 T = TypeVar("T")
 
 _SENSITIVE_HEADER = re.compile(r"(?:authorization|cookie|token|secret|api[-_]?key)", re.I)
-_SENSITIVE_FIELD = re.compile(r"(?:password|passwd|token|secret|api[-_]?key|credential)", re.I)
 _CONFIRMATION = re.compile(
     r"(?:成功|已提交|已发送|已保存|已创建|感谢|确认号|success|submitted|sent|saved|created|thank you|confirmation)",
     re.I,
@@ -82,7 +82,7 @@ _MARK_AND_COLLECT = r"""
       if (text.length > 500) text = text.slice(0, 500) + '...';
       const item = {
         bid, frame: frameIndex, tag: el.tagName.toLowerCase(), role, label,
-        text, value: 'value' in el ? String(el.value || '') : '',
+        text, value: 'value' in el ? (el.type === 'password' ? '[REDACTED]' : String(el.value || '')) : '',
         checked: 'checked' in el ? Boolean(el.checked) : null,
         selected: 'selected' in el ? Boolean(el.selected) : null,
         disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
@@ -106,22 +106,67 @@ _MARK_AND_COLLECT = r"""
 
 
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {key: value for key, value in headers.items() if not _SENSITIVE_HEADER.search(key)}
+    return {
+        key: redact_text(value)
+        for key, value in headers.items()
+        if not _SENSITIVE_HEADER.search(key)
+    }
 
 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: ("[REDACTED]" if _SENSITIVE_FIELD.search(str(key)) else _redact(item)) for key, item in value.items()}
+        return {key: ("[REDACTED]" if SENSITIVE_FIELD.search(str(key)) else _redact(item)) for key, item in value.items()}
     if isinstance(value, list):
         return [_redact(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 
-def _safe_json_body(text: str) -> Any:
+def _request_body_size(request: Any, headers: dict[str, str]) -> int | None:
+    length_header = headers.get("content-length", "")
+    if length_header:
+        try:
+            length = int(length_header)
+            return length if length >= 0 else None
+        except ValueError:
+            return None
+    try:
+        sizes = request.sizes()
+        length = int(sizes.get("requestBodySize", -1))
+        return length if length >= 0 else None
+    except Exception:
+        return None
+
+
+def _error_type(exc: Exception) -> str:
+    return type(exc).__name__
+
+
+def _opaque_body(raw: bytes, limit: int) -> dict[str, Any]:
+    return {
+        "binary_or_unstructured": True,
+        "byte_length": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "truncated": len(raw) > limit,
+    }
+
+
+def _safe_post_data(raw: bytes, limit: int, content_type: str = "") -> Any:
+    normalized_type = content_type.lower()
+    if len(raw) > limit or "multipart/" in normalized_type:
+        return _opaque_body(raw, limit)
+    bounded = raw[:limit]
+    try:
+        text = bounded.decode("utf-8")
+    except UnicodeDecodeError:
+        return _opaque_body(raw, limit)
+    if "application/x-www-form-urlencoded" in normalized_type:
+        return _redact(parse_qs(text, keep_blank_values=True))
     try:
         return _redact(json.loads(text))
     except (json.JSONDecodeError, TypeError):
-        return text
+        return _opaque_body(raw, limit)
 
 
 class BrowserActor:
@@ -243,7 +288,7 @@ class BrowserActor:
         self._settle()
         self._refresh_cdp()
         self._capture_step("start")
-        return {"url": self._page.url, "connected": self._connected}
+        return {"url": sanitize_url(self._page.url), "connected": self._connected}
 
     def _refresh_cdp(self) -> None:
         if self._cdp:
@@ -269,24 +314,36 @@ class BrowserActor:
     def _on_page(self, page: Any) -> None:
         self._assert_thread()
         self._attach_page(page)
-        self._new_pages.append(page.url)
+        self._new_pages.append(sanitize_url(page.url))
 
     def _on_dialog(self, dialog: Any) -> None:
         self._assert_thread()
         action, prompt_text = self._next_dialog_action
-        record = {"type": dialog.type, "message": dialog.message, "action": action, "url": self._page.url}
+        record = {
+            "type": dialog.type,
+            "message": redact_text(dialog.message),
+            "action": action,
+            "url": sanitize_url(self._page.url),
+        }
         try:
             if action == "accept":
                 dialog.accept(prompt_text=prompt_text)
             else:
                 dialog.dismiss()
         except Exception as exc:
-            record["error"] = str(exc)
+            record["error"] = _error_type(exc)
         self._dialogs.append(record)
         self._next_dialog_action = ("dismiss", None)
 
     def _on_response(self, response: Any) -> None:
         self._assert_thread()
+        try:
+            self._capture_response(response)
+        except Exception as exc:
+            if len(self._network_records) < self.max_network_records:
+                self._network_records.append({"capture_error": _error_type(exc)})
+
+    def _capture_response(self, response: Any) -> None:
         content_type = response.headers.get("content-type", "").lower()
         if "application/pdf" in content_type:
             self._pdf_responses.append(response)
@@ -296,23 +353,55 @@ class BrowserActor:
         if request.resource_type not in {"xhr", "fetch"}:
             return
         record: dict[str, Any] = {
-            "url": response.url,
+            "url": sanitize_url(response.url),
             "status": response.status,
             "method": request.method,
             "resource_type": request.resource_type,
             "request_headers": _sanitize_headers(request.headers),
             "response_headers": _sanitize_headers(response.headers),
         }
-        post_data = request.post_data
-        if post_data:
-            record["post_data"] = _safe_json_body(post_data[: self.response_body_limit])
+        request_content_type = record["request_headers"].get("content-type", "")
+        if request.method.upper() not in {"GET", "HEAD"}:
+            request_body_size = _request_body_size(request, record["request_headers"])
+            if request_body_size is None:
+                record["post_data_skipped"] = "请求未声明可信正文长度"
+            elif request_body_size > self.response_body_limit:
+                record["post_data_skipped"] = f"请求正文长度 {request_body_size} 超过采集上限"
+                record["post_data_truncated"] = True
+            elif request_body_size > 0:
+                try:
+                    post_data = request.post_data_buffer
+                except Exception as exc:
+                    record["post_data_error"] = _error_type(exc)
+                else:
+                    if post_data:
+                        record["post_data"] = _safe_post_data(
+                            post_data,
+                            self.response_body_limit,
+                            request_content_type,
+                        )
+                        record["post_data_truncated"] = len(post_data) > self.response_body_limit
         if any(token in content_type for token in ("json", "text", "xml", "javascript")):
+            length_header = record["response_headers"].get("content-length", "")
+            content_encoding = record["response_headers"].get("content-encoding", "").lower()
             try:
-                body = response.body()[: self.response_body_limit]
-                record["body"] = _safe_json_body(body.decode("utf-8", errors="replace"))
-                record["body_truncated"] = len(body) >= self.response_body_limit
-            except Exception as exc:
-                record["body_error"] = str(exc)
+                declared_length = int(length_header) if length_header else None
+            except ValueError:
+                declared_length = None
+            if declared_length is None or declared_length < 0:
+                record["body_skipped"] = "响应未声明可信 Content-Length"
+            elif content_encoding and content_encoding != "identity":
+                record["body_skipped"] = f"响应使用 {content_encoding} 压缩，跳过解压后大小未知的正文"
+            elif declared_length > self.response_body_limit:
+                record["body_skipped"] = f"声明长度 {declared_length} 超过采集上限"
+                record["body_truncated"] = True
+            else:
+                try:
+                    body = response.body()
+                    record["body"] = _safe_post_data(body, self.response_body_limit, content_type)
+                    record["body_truncated"] = len(body) > self.response_body_limit
+                except Exception as exc:
+                    record["body_error"] = _error_type(exc)
         self._network_records.append(record)
 
     def _ensure_live(self) -> None:
@@ -389,11 +478,13 @@ class BrowserActor:
                         {"frameIndex": frame_index, "maxElements": 4_000},
                     )
                 except Exception as exc:
-                    elements.append({"frame": frame_index, "frame_error": str(exc), "url": frame.url})
+                    elements.append(
+                        {"frame": frame_index, "frame_error": _error_type(exc), "url": sanitize_url(frame.url)}
+                    )
                     continue
                 truncated = truncated or bool(result["truncated"])
                 for item in result["elements"]:
-                    item["frame_url"] = frame.url
+                    item["frame_url"] = sanitize_url(frame.url)
                 elements.extend(result["elements"])
             raw_snapshot, ax_tree = self._protocol_observation()
         finally:
@@ -413,10 +504,10 @@ class BrowserActor:
             "screenshot_sent_to_model": False,
         }
         evidence = self.evidence_store.add(
-            "dom", self._page.url, f"DOM/AX 观察，共 {len(elements)} 个结构化元素", payload
+            "dom", sanitize_url(self._page.url), f"DOM/AX 观察，共 {len(elements)} 个结构化元素", payload
         )
         return {
-            "url": self._page.url,
+            "url": sanitize_url(self._page.url),
             "title": self._page.title(),
             "dom_hash": dom_hash,
             "elements": elements,
@@ -435,11 +526,11 @@ class BrowserActor:
                 temp_data_cleanup=True,
             )
         except Exception as exc:
-            dom_snapshot = {"error": str(exc)}
+            dom_snapshot = {"error": _error_type(exc)}
         try:
             merged_ax_tree = browsergym_extract_merged_axtree(self._page)
         except Exception as exc:
-            merged_ax_tree = {"error": str(exc), "nodes": []}
+            merged_ax_tree = {"error": _error_type(exc), "nodes": []}
         return dom_snapshot, [merged_ax_tree]
 
     def _locator(self, bid: str) -> Any:
@@ -469,7 +560,11 @@ class BrowserActor:
     def _fill_op(self, bid: str, value: str) -> dict[str, Any]:
         locator = self._locator(bid)
         locator.fill(value, timeout=self.click_timeout_ms)
-        return {"value": locator.input_value(), "expected_value": value}
+        is_password = (locator.get_attribute("type") or "").casefold() == "password"
+        return {
+            "value": "[REDACTED]" if is_password else locator.input_value(),
+            "expected_value": "[REDACTED]" if is_password else value,
+        }
 
     async def select(self, bid: str, values: list[str]) -> dict[str, Any]:
         return await self._call(self._action_sync, "select", lambda: self._select_op(bid, values), bid)
@@ -550,7 +645,12 @@ class BrowserActor:
         pages = [page for page in self._context.pages if not page.is_closed()]
         if action == "list":
             self._capture_step("tabs:list")
-            return {"tabs": [{"index": i, "url": p.url, "active": p == self._page} for i, p in enumerate(pages)]}
+            return {
+                "tabs": [
+                    {"index": i, "url": sanitize_url(p.url), "active": p == self._page}
+                    for i, p in enumerate(pages)
+                ]
+            }
         if action == "switch":
             if index is None or index < 0 or index >= len(pages):
                 raise ValueError("tab index 越界")
@@ -578,7 +678,12 @@ class BrowserActor:
         self._settle()
         self._capture_step(f"tabs:{action}")
         pages = [page for page in self._context.pages if not page.is_closed()]
-        return {"tabs": [{"index": i, "url": p.url, "active": p == self._page} for i, p in enumerate(pages)]}
+        return {
+            "tabs": [
+                {"index": i, "url": sanitize_url(p.url), "active": p == self._page}
+                for i, p in enumerate(pages)
+            ]
+        }
 
     async def upload(self, bid: str, paths: list[str]) -> dict[str, Any]:
         return await self._call(self._action_sync, "upload", lambda: self._upload_op(bid, paths), bid)
@@ -607,7 +712,11 @@ class BrowserActor:
             download = info.value
             destination = self.output_dir / "downloads" / download.suggested_filename
             download.save_as(str(destination))
-            record = {"filename": download.suggested_filename, "path": str(destination), "url": download.url}
+            record = {
+                "filename": download.suggested_filename,
+                "path": str(destination),
+                "url": sanitize_url(download.url),
+            }
         except PlaywrightTimeoutError as exc:
             candidates = self._pdf_responses[pdf_cursor:]
             if not candidates:
@@ -617,7 +726,12 @@ class BrowserActor:
             filename = parsed_name if parsed_name.lower().endswith(".pdf") else "browser-inline.pdf"
             destination = self.output_dir / "downloads" / filename
             destination.write_bytes(response.body())
-            record = {"filename": filename, "path": str(destination), "url": response.url, "inline_pdf": True}
+            record = {
+                "filename": filename,
+                "path": str(destination),
+                "url": sanitize_url(response.url),
+                "inline_pdf": True,
+            }
         self._downloads.append(record)
         return {"download": record}
 
@@ -646,10 +760,10 @@ class BrowserActor:
         else:
             raise ValueError("extract kind 仅支持 text/links/table/list")
         evidence = self.evidence_store.add(
-            "dom", self._page.url, f"结构化提取 {kind}", {"kind": kind, "bid": bid, "data": data}
+            "dom", sanitize_url(self._page.url), f"结构化提取 {kind}", {"kind": kind, "bid": bid, "data": data}
         )
         self._capture_step(f"extract:{kind}")
-        return {"data": data, "evidence_id": evidence.evidence_id, "url": self._page.url}
+        return {"data": data, "evidence_id": evidence.evidence_id, "url": sanitize_url(self._page.url)}
 
     async def network_events(self, since_last: bool = True) -> dict[str, Any]:
         return await self._call(self._network_events_sync, since_last)
@@ -758,7 +872,7 @@ class BrowserActor:
 
     def _element_state(self, locator: Any) -> dict[str, Any]:
         return locator.evaluate(
-            "el => ({bid:el.getAttribute('bid'),tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.innerText||el.textContent||'').trim().slice(0,300),value:'value' in el?String(el.value||''):'',checked:'checked' in el?Boolean(el.checked):null,selected:'selected' in el?Boolean(el.selected):null})"
+            "el => ({bid:el.getAttribute('bid'),tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.innerText||el.textContent||'').trim().slice(0,300),value:'value' in el?(el.type==='password'?'[REDACTED]':String(el.value||'')):'',checked:'checked' in el?Boolean(el.checked):null,selected:'selected' in el?Boolean(el.selected):null})"
         )
 
     def _action_sync(self, action: str, operation: Callable[[], dict[str, Any]], bid: str | None) -> dict[str, Any]:
@@ -770,7 +884,17 @@ class BrowserActor:
             before_url = self._page.url
             before_hash = self._dom_hash()
         except Exception as exc:
-            receipt = ActionReceipt(action_id, action, False, "", "", "", "", {}, error=str(exc))
+            receipt = ActionReceipt(
+                action_id,
+                action,
+                False,
+                "",
+                "",
+                "",
+                "",
+                {},
+                error=sanitize_exception(exc),
+            )
             return receipt.to_dict()
         dialogs_before = len(self._dialogs)
         pages_before = len(self._context.pages)
@@ -789,8 +913,8 @@ class BrowserActor:
                 self._settle()
             success = True
         except Exception as exc:
-            error = str(exc)
-            stale = "STALE_BID" in error
+            stale = "STALE_BID" in str(exc)
+            error = sanitize_exception(exc)
             success = False
         try:
             after_url = self._page.url
@@ -800,7 +924,7 @@ class BrowserActor:
             after_url, after_hash, page_text = before_url, before_hash, ""
             self._connected = False
             success = False
-            error = error or str(exc)
+            error = error or sanitize_exception(exc)
         postconditions.update(
             {
                 "bid": bid,
@@ -816,21 +940,22 @@ class BrowserActor:
                 ),
             }
         )
+        public_postconditions = redact_value(postconditions)
         receipt_evidence = self.evidence_store.add(
             "receipt",
-            after_url,
+            sanitize_url(after_url),
             f"{action} {'成功' if success else '失败'}",
-            {"action_id": action_id, "postconditions": postconditions, "error": error},
+            {"action_id": action_id, "postconditions": public_postconditions, "error": error},
         )
         receipt = ActionReceipt(
             action_id,
             action,
             success,
-            before_url,
-            after_url,
+            sanitize_url(before_url),
+            sanitize_url(after_url),
             before_hash,
             after_hash,
-            postconditions,
+            public_postconditions,
             (receipt_evidence.evidence_id,),
             error,
             stale,

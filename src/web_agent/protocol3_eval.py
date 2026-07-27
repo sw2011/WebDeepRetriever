@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .sanitization import public_error_summary
+
 
 REQUIRED_FIELDS = ("task_idx", "task_id", "website", "task", "answer")
 _EXHAUSTIVE_PATTERN = re.compile(
@@ -334,11 +336,13 @@ def compare_results(
 
         used_paths.add(candidate["path"])
         result = candidate["value"]
-        has_answer = "agent_answer" in result and result["agent_answer"] is not None
-        actual = result.get("agent_answer")
-        expected = item["answer"]
         result_status = str(result.get("status", "UNKNOWN"))
+        actual = result.get("agent_answer")
+        has_answer = result_status == "SUCCESS" and actual not in (None, "", [], {})
+        expected = item["answer"]
         reason = result.get("error")
+        if result_status == "SUCCESS" and not has_answer:
+            reason = "SUCCESS 结果缺少非空 agent_answer"
         if result_status != "SUCCESS" and not reason:
             reason = f"任务已运行但状态为 {result_status}"
         rows.append(
@@ -348,8 +352,8 @@ def compare_results(
                 "website": item["website"],
                 "execution": "RUN_WITH_ANSWER" if has_answer else "RUN_NO_ANSWER",
                 "result_status": result_status,
-                "reason": str(reason) if reason else None,
-                "agent_answer": actual,
+                "reason": public_error_summary(str(reason)) if reason else None,
+                "agent_answer": actual if has_answer else None,
                 "expected_answer": expected,
                 "exact_match": _strict_equal(actual, expected) if has_answer else None,
                 "normalized_match": _strict_equal(normalize_answer(actual), normalize_answer(expected))
@@ -373,9 +377,13 @@ def compare_results(
         "total_tasks": total,
         "executed_tasks": executed,
         "not_run_tasks": total - executed,
-        "successful_results": sum(row["result_status"] == "SUCCESS" for row in rows),
+        "successful_results": sum(
+            row["result_status"] == "SUCCESS" and row["execution"] == "RUN_WITH_ANSWER" for row in rows
+        ),
         "failed_results": sum(
-            row["execution"] != "NOT_RUN" and row["result_status"] != "SUCCESS" for row in rows
+            row["execution"] != "NOT_RUN"
+            and not (row["result_status"] == "SUCCESS" and row["execution"] == "RUN_WITH_ANSWER")
+            for row in rows
         ),
         "comparable_tasks": len(comparable),
         "exact_matches": exact_matches,

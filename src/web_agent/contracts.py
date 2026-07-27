@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from .sanitization import redact_text, redact_value, sanitize_error_text, sanitize_url
+
 
 EvidenceSource = Literal["dom", "accessibility", "network", "document", "visual", "receipt"]
 
@@ -26,9 +28,9 @@ class EvidenceRef:
         return {
             "evidence_id": self.evidence_id,
             "source": self.source,
-            "url": self.url,
-            "summary": self.summary,
-            "payload": self.payload,
+            "url": sanitize_url(self.url),
+            "summary": redact_text(self.summary),
+            "payload": redact_value(self.payload),
             "created_at": self.created_at,
         }
 
@@ -57,14 +59,14 @@ class ActionReceipt:
             "action_id": self.action_id,
             "action": self.action,
             "success": self.success,
-            "before_url": self.before_url,
-            "after_url": self.after_url,
+            "before_url": sanitize_url(self.before_url),
+            "after_url": sanitize_url(self.after_url),
             "before_dom_hash": self.before_dom_hash,
             "after_dom_hash": self.after_dom_hash,
             "changed": self.changed,
-            "postconditions": self.postconditions,
+            "postconditions": redact_value(self.postconditions),
             "evidence_ids": list(self.evidence_ids),
-            "error": self.error,
+            "error": sanitize_error_text(self.error) if self.error else None,
             "stale_bid": self.stale_bid,
             "created_at": self.created_at,
         }
@@ -155,4 +157,3 @@ class TaskContract:
             requires_form_confirmation=bool(_FORM_PATTERNS.search(task)),
             max_steps=min(max(int(max_steps), 1), 100),
         )
-

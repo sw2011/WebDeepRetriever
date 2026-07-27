@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import EvidenceRef, EvidenceSource
+from .sanitization import redact_text, redact_value, sanitize_url
 
 
 class EvidenceStore:
@@ -26,7 +27,13 @@ class EvidenceStore:
         with self._lock:
             self._counter += 1
             evidence_id = f"ev-{self._counter:05d}"
-            ref = EvidenceRef(evidence_id, source, url, summary[:500], payload)
+            ref = EvidenceRef(
+                evidence_id,
+                source,
+                sanitize_url(url),
+                redact_text(summary[:500]),
+                redact_value(payload),
+            )
             self._items[evidence_id] = ref
             return ref
 
@@ -47,4 +54,3 @@ class EvidenceStore:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(json.dumps(self.to_list(), ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
-

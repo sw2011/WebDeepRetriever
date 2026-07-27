@@ -155,11 +155,19 @@ def test_coverage_requires_terminal_evidence_counts_and_fingerprint() -> None:
 def test_evidence_store_is_append_only_and_ids_are_deterministic(tmp_path) -> None:
     store = EvidenceStore()
     first = store.add("dom", "https://example.test", "one", {"x": 1})
-    second = store.add("network", "https://example.test", "two", {"x": 2})
+    second = store.add(
+        "network",
+        "https://user:password@example.test?access_token=private",
+        "two",
+        {"message": "Bearer private", "session": "private"},
+    )
     assert (first.evidence_id, second.evidence_id) == ("ev-00001", "ev-00002")
+    assert "private" not in str(second.to_dict())
+    assert "password" not in second.url
     with pytest.raises(Exception):
         first.payload = {"changed": True}  # type: ignore[misc]
     path = tmp_path / "evidence.json"
     store.save(path)
-    assert '"ev-00002"' in path.read_text(encoding="utf-8")
-
+    serialized = path.read_text(encoding="utf-8")
+    assert '"ev-00002"' in serialized
+    assert "private" not in serialized

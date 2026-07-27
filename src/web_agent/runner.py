@@ -15,6 +15,7 @@ from .browser_actor import BrowserActor
 from .contracts import TaskContract
 from .evidence import EvidenceStore
 from .runtime import ProtocolIIIAgent
+from .sanitization import sanitize_exception
 
 
 @dataclass(frozen=True)
@@ -84,12 +85,12 @@ async def _worker_async(config: WorkerConfig, items: list[dict[str, Any]]) -> li
                     "urls": [],
                     "receipts": [],
                     "predict_length": 0,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": sanitize_exception(exc),
                 }
             try:
                 await actor.flush_artifacts()
             except Exception as exc:
-                run_result["artifact_error"] = f"{type(exc).__name__}: {exc}"
+                run_result["artifact_error"] = sanitize_exception(exc)
             evidence_store.save(task_dir / "evidence.json")
             result = {
                 "task_idx": contract.task_idx,
@@ -128,7 +129,7 @@ def worker_entry(config_dict: dict[str, Any], items: list[dict[str, Any]], queue
         summaries = asyncio.run(_worker_async(config, items))
         queue.put({"worker_id": config.worker_id, "summaries": summaries, "error": None})
     except BaseException as exc:
-        queue.put({"worker_id": config.worker_id, "summaries": [], "error": f"{type(exc).__name__}: {exc}"})
+        queue.put({"worker_id": config.worker_id, "summaries": [], "error": sanitize_exception(exc)})
 
 
 def run_tasks(

@@ -200,3 +200,34 @@ def test_normalize_answer_is_conservative() -> None:
     assert normalize_answer(["A", "B"]) == ["a", "b"]
     assert normalize_answer(["A", "B"]) != normalize_answer(["B", "A"])
     assert normalize_answer(1) == 1
+
+
+def test_compare_only_scores_nonempty_success_answers_and_sanitizes_errors(tmp_path: Path) -> None:
+    tasks = _tasks()[:3]
+    results = tmp_path / "results"
+    _write_json(
+        results / "0_lookup" / "result.json",
+        {"task_idx": 0, "task_id": "lookup", "status": "FAIL_AGENT_ERROR", "agent_answer": "Alpha"},
+    )
+    _write_json(
+        results / "1_analytical" / "result.json",
+        {"task_idx": 1, "task_id": "analytical", "status": "SUCCESS", "agent_answer": ""},
+    )
+    _write_json(
+        results / "2_exhaustive" / "result.json",
+        {
+            "task_idx": 2,
+            "task_id": "exhaustive",
+            "status": "FAIL_AGENT_ERROR",
+            "error": "RateLimitError 429 TPM org-private ak-private-private",
+        },
+    )
+
+    report = compare_results(tasks, results)
+
+    assert report["summary"]["successful_results"] == 0
+    assert report["summary"]["failed_results"] == 3
+    assert report["summary"]["comparable_tasks"] == 0
+    assert report["tasks"][0]["agent_answer"] is None
+    assert report["tasks"][1]["reason"] == "SUCCESS 结果缺少非空 agent_answer"
+    assert report["tasks"][2]["reason"] == "模型 API 429：组织级 TPM 限额"

@@ -17,6 +17,9 @@ from web_agent.runtime import (
     ProtocolIIIAgent,
     TaskRuntimeContext,
     _coverage_items,
+    _error,
+    _kimi_request_options,
+    _model_settings,
     _verified_finish_behavior,
 )
 from web_agent.verifier import CompletionVerifier
@@ -67,12 +70,41 @@ def test_all_function_tools_have_strict_closed_schemas() -> None:
         assert tool.params_json_schema.get("additionalProperties") is False
 
 
+def test_kimi_k26_uses_tool_compatible_settings() -> None:
+    settings = _model_settings("kimi-k2.6")
+    assert settings.temperature == 0.6
+    assert settings.tool_choice == "required"
+    assert settings.parallel_tool_calls is False
+    assert settings.extra_body == {"thinking": {"type": "disabled"}}
+
+    default_settings = _model_settings("gpt-4.1-mini")
+    assert default_settings.temperature == 0
+    assert default_settings.extra_body is None
+    assert _kimi_request_options("kimi-k2.6") == {
+        "temperature": 0.6,
+        "extra_body": {"thinking": {"type": "disabled"}},
+    }
+    assert _kimi_request_options("gpt-4.1-mini") == {}
+
+
 def test_hard_step_limit_rejects_call_101() -> None:
     context = make_context(100)
     for index in range(100):
         context.record_call("observe", {"index": index})
     with pytest.raises(RuntimeError, match="STEP_LIMIT"):
         context.record_call("observe", {})
+
+
+def test_tool_errors_are_sanitized_before_model_output() -> None:
+    output = _error(
+        "observe",
+        RuntimeError("connect https://user:password@example.test?access_token=private Bearer private"),
+    )
+    assert "private" not in output
+    assert "password" not in output
+    context = make_context()
+    context.record_call("tabs", {"url": "https://example.test?access_token=private"})
+    assert "private" not in str(context.actions)
 
 
 def test_coverage_item_extraction_handles_dom_and_network_shapes() -> None:
