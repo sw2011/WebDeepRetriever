@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -20,7 +22,7 @@ from agents import (
     ToolsToFinalOutputResult,
     function_tool,
 )
-from agents.extensions import ToolOutputTrimmer
+from agents.lifecycle import RunHooksBase
 from agents.run_config import CallModelData, ModelInputData
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,7 +30,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from .browser_actor import BrowserActor
 from .contracts import ActionReceipt, CoverageCertificate, TaskContract
 from .evidence import EvidenceStore
-from .sanitization import redact_value, sanitize_exception
+from .sanitization import redact_value, sanitize_exception, sanitize_url
+from .token_control import SharedTPMLimiter, TaskUsageStats, ThrottledModel, estimate_input_tokens
 from .verifier import CompletionVerifier
 
 
@@ -45,6 +48,8 @@ SYSTEM_INSTRUCTIONS = """你是 WebRetriever Protocol III 的网页任务执行 
 7. finish 的 evidence_bindings 要覆盖答案文本根字段 `$`；所有 evidence_ids 都必须真实存在。
 8. 不得直接输出最终文本。每一轮必须调用且只调用一个工具，最终只能调用 finish。
 9. 工具 Schema 中标记 required 但允许 null 的参数必须显式传 null，不得省略或添加未知字段。
+10. observe 返回 unchanged=true 时不得继续重复 observe/tabs(list)/wait；应使用现有 bid 操作、按需 extract，或在证据不足时 finish 失败原因。
+11. 历史摘要中的结构化证据如需尾部或完整分块，使用 recall_evidence 按 evidence_id 和 offset 回读，不要重复抓取页面。
 """
 
 
@@ -76,48 +81,189 @@ class EvidenceBindingInput(BaseModel):
 
 
 class BoundedToolOutputFilter:
-    """Compose the SDK trimmer with a tool-count window for single-user-message runs."""
+    """Keep only the latest necessary payloads and summarize older tool history."""
 
-    def __init__(self, keep_recent_outputs: int = 8, old_output_chars: int = 4_000) -> None:
+    _CONTENT_TOOLS = {"extract", "network", "document", "recall_evidence"}
+
+    def __init__(
+        self,
+        keep_recent_outputs: int = 4,
+        old_output_chars: int = 800,
+        max_current_output_chars: int = 24_000,
+        max_total_output_chars: int = 72_000,
+    ) -> None:
         self.keep_recent_outputs = keep_recent_outputs
         self.old_output_chars = old_output_chars
-        self.sdk_trimmer = ToolOutputTrimmer(
-            recent_turns=1,
-            max_output_chars=24_000,
-            preview_chars=4_000,
-            trimmable_tools={"observe", "extract", "network", "document"},
-        )
+        self.max_current_output_chars = max_current_output_chars
+        self.max_total_output_chars = max_total_output_chars
+
+    @staticmethod
+    def _text(output: Any) -> str:
+        return output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _summary(tool: str, text: str, preview_chars: int) -> str:
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        summary: dict[str, Any] = {
+            "compacted_tool_output": True,
+            "tool": tool,
+            "original_chars": len(text),
+        }
+        if isinstance(payload, dict):
+            for key in (
+                "ok",
+                "accepted",
+                "success",
+                "action_id",
+                "action",
+                "changed",
+                "url",
+                "title",
+                "dom_hash",
+                "evidence_id",
+                "evidence_ids",
+                "coverage_evidence_id",
+                "element_count",
+                "total_element_count",
+                "unchanged",
+                "stale_bid",
+                "error",
+                "reasons",
+                "certificate",
+            ):
+                if key in payload:
+                    summary[key] = payload[key]
+            content = next(
+                (
+                    payload[key]
+                    for key in ("data", "records", "text", "content", "preview")
+                    if payload.get(key) is not None
+                ),
+                None,
+            )
+            if content is not None and preview_chars:
+                encoded = (
+                    content
+                    if isinstance(content, str)
+                    else json.dumps(content, ensure_ascii=False, separators=(",", ":"), default=str)
+                )
+                summary["content_chars"] = len(encoded)
+                summary["content_preview"] = encoded[:preview_chars]
+            if tool in BoundedToolOutputFilter._CONTENT_TOOLS and payload.get("evidence_id"):
+                summary["recall_instruction"] = (
+                    "需要此证据的其余内容时调用 recall_evidence，并从 offset=0 开始按 next_offset 续读"
+                )
+        elif preview_chars:
+            summary["content_preview"] = text[:preview_chars]
+        return _json(summary, limit=max(1_000, preview_chars + 800))
 
     def __call__(self, data: CallModelData[Any]) -> ModelInputData:
-        model_data = self.sdk_trimmer(data)
+        model_data = data.model_data
+        call_names = {
+            str(item.get("call_id")): str(item.get("name", "unknown"))
+            for item in model_data.input
+            if isinstance(item, dict) and item.get("type") == "function_call"
+        }
         output_indexes = [
             index
             for index, item in enumerate(model_data.input)
             if isinstance(item, dict) and item.get("type") == "function_call_output"
         ]
-        old_indexes = set(output_indexes[: -self.keep_recent_outputs]) if len(output_indexes) > self.keep_recent_outputs else set()
-        if not old_indexes:
-            return model_data
+        names = {
+            index: call_names.get(str(model_data.input[index].get("call_id")), "unknown")
+            for index in output_indexes
+        }
+        observe_indexes = [index for index in output_indexes if names[index] == "observe"]
+        latest_observe = observe_indexes[-1] if observe_indexes else None
+        repeated_observe_base: int | None = None
+        if latest_observe is not None:
+            try:
+                latest_observe_payload = json.loads(self._text(model_data.input[latest_observe].get("output")))
+            except (json.JSONDecodeError, TypeError):
+                latest_observe_payload = {}
+            if latest_observe_payload.get("unchanged") is True:
+                for observe_index in reversed(observe_indexes[:-1]):
+                    try:
+                        payload = json.loads(self._text(model_data.input[observe_index].get("output")))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if payload.get("unchanged") is not True:
+                        repeated_observe_base = observe_index
+                        break
+        latest_content = next(
+            (index for index in reversed(output_indexes) if names[index] in self._CONTENT_TOOLS), None
+        )
+        non_content = [
+            index
+            for index in output_indexes
+            if names[index] not in {"observe", *self._CONTENT_TOOLS}
+        ]
+        keep_full = set(non_content[-self.keep_recent_outputs :])
+        keep_full.update(
+            index
+            for index in (latest_observe, latest_content, repeated_observe_base)
+            if index is not None
+        )
         bounded: list[Any] = []
+        output_positions = {index: position for position, index in enumerate(output_indexes)}
         for index, item in enumerate(model_data.input):
-            if index not in old_indexes or not isinstance(item, dict):
+            if index not in names or not isinstance(item, dict):
                 bounded.append(item)
                 continue
             output = item.get("output")
-            text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-            if len(text) <= self.old_output_chars:
+            text = self._text(output)
+            replacement = dict(item)
+            if index in keep_full and len(text) <= self.max_current_output_chars:
                 bounded.append(item)
                 continue
-            replacement = dict(item)
-            replacement["output"] = _json(
-                {
-                    "trimmed_old_tool_output": True,
-                    "original_chars": len(text),
-                    "preview": text[: self.old_output_chars],
-                },
-                limit=self.old_output_chars + 500,
-            )
+            if index in keep_full:
+                replacement["output"] = self._summary(
+                    names[index], text, max(0, self.max_current_output_chars - 1_200)
+                )
+            else:
+                age = len(output_indexes) - output_positions[index]
+                preview = self.old_output_chars if age <= 12 else min(180, self.old_output_chars)
+                replacement["output"] = self._summary(names[index], text, preview)
             bounded.append(replacement)
+
+        def output_chars(items: list[Any]) -> int:
+            return sum(
+                len(self._text(item.get("output")))
+                for item in items
+                if isinstance(item, dict) and item.get("type") == "function_call_output"
+            )
+
+        if output_chars(bounded) > self.max_total_output_chars:
+            for index, item in enumerate(bounded):
+                if output_chars(bounded) <= self.max_total_output_chars:
+                    break
+                if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                    continue
+                original_index = index
+                if original_index in keep_full:
+                    continue
+                tool = call_names.get(str(item.get("call_id")), "unknown")
+                replacement = dict(item)
+                replacement["output"] = self._summary(tool, self._text(item.get("output")), 0)
+                bounded[index] = replacement
+        protected = {
+            index
+            for index in (latest_observe, latest_content, repeated_observe_base)
+            if index is not None
+        }
+        if output_chars(bounded) > self.max_total_output_chars:
+            for index, item in enumerate(bounded):
+                if output_chars(bounded) <= self.max_total_output_chars:
+                    break
+                if index in protected or not isinstance(item, dict) or item.get("type") != "function_call_output":
+                    continue
+                tool = call_names.get(str(item.get("call_id")), "unknown")
+                replacement = dict(item)
+                replacement["output"] = self._summary(tool, self._text(item.get("output")), 0)
+                bounded[index] = replacement
         return ModelInputData(input=bounded, instructions=model_data.instructions)
 
 
@@ -144,6 +290,15 @@ class TaskRuntimeContext:
     tool_steps: int = 0
     coverage_records: dict[str, CoverageCertificate] = field(default_factory=dict)
     coverage_evidence_ids: dict[str, str] = field(default_factory=dict)
+    usage_stats: TaskUsageStats | None = None
+    rate_limiter: SharedTPMLimiter | None = None
+    last_observation_state: tuple[str, str] | None = None
+    seen_page_states: set[tuple[str, str]] = field(default_factory=set)
+    seen_tab_states: set[str] = field(default_factory=set)
+    no_progress_streak: int = 0
+    no_progress_limit: int = 8
+    loop_detected: bool = False
+    loop_reason: str | None = None
 
     def record_call(self, name: str, arguments: dict[str, Any]) -> None:
         if self.tool_steps >= self.contract.max_steps:
@@ -154,38 +309,304 @@ class TaskRuntimeContext:
         )
 
     def record_receipt(self, result: dict[str, Any]) -> None:
-        self.receipts.append(
-            ActionReceipt(
-                action_id=result["action_id"],
-                action=result["action"],
-                success=result["success"],
-                before_url=result["before_url"],
-                after_url=result["after_url"],
-                before_dom_hash=result["before_dom_hash"],
-                after_dom_hash=result["after_dom_hash"],
-                postconditions=result["postconditions"],
-                evidence_ids=tuple(result.get("evidence_ids", [])),
-                error=result.get("error"),
-                stale_bid=result.get("stale_bid", False),
-                created_at=result.get("created_at", ""),
-            )
+        receipt = ActionReceipt(
+            action_id=result["action_id"],
+            action=result["action"],
+            success=result["success"],
+            before_url=result["before_url"],
+            after_url=result["after_url"],
+            before_dom_hash=result["before_dom_hash"],
+            after_dom_hash=result["after_dom_hash"],
+            postconditions=result["postconditions"],
+            evidence_ids=tuple(result.get("evidence_ids", [])),
+            error=result.get("error"),
+            stale_bid=result.get("stale_bid", False),
+            created_at=result.get("created_at", ""),
         )
+        self.receipts.append(receipt)
         if result.get("after_url"):
             self.visited_urls.append(result["after_url"])
+
+        postconditions = result.get("postconditions", {})
+        progress = receipt.changed
+        if receipt.success and receipt.action == "scroll":
+            progress = progress or postconditions.get("after") != postconditions.get("before")
+        if receipt.success and receipt.action in {"fill", "select", "set_checked"}:
+            progress = progress or bool(postconditions.get("value_changed"))
+        if receipt.success and receipt.action in {"upload", "download"}:
+            progress = True
+        progress = progress or bool(
+            postconditions.get("new_tab_count")
+            or postconditions.get("dialog_events")
+            or postconditions.get("network_response_count")
+            or postconditions.get("confirmation")
+        )
+        self.note_progress(progress, f"action:{receipt.action}")
+
+    def note_page_state(self, url: str, dom_hash: str) -> bool:
+        state = (url, dom_hash)
+        unchanged = state == self.last_observation_state
+        is_new = state not in self.seen_page_states
+        self.seen_page_states.add(state)
+        self.last_observation_state = state
+        self.note_progress(is_new, "observe")
+        return unchanged
+
+    def note_tab_state(self, tabs_value: list[dict[str, Any]]) -> None:
+        signature = hashlib.sha256(
+            json.dumps(tabs_value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        is_new = signature not in self.seen_tab_states
+        self.seen_tab_states.add(signature)
+        self.note_progress(is_new, "tabs")
+
+    def note_progress(self, progressed: bool, source: str) -> None:
+        if progressed:
+            self.no_progress_streak = 0
+            return
+        self.no_progress_streak += 1
+        if self.no_progress_streak >= self.no_progress_limit and not self.loop_detected:
+            self.loop_detected = True
+            self.loop_reason = (
+                f"NO_PROGRESS_LOOP: 连续 {self.no_progress_streak} 次 observe/tabs/wait/动作未产生新页面状态"
+            )
+            self.thoughts.append(f"loop_guard: {source} 触发无进展保护")
+
+
+class NoProgressLoopError(RuntimeError):
+    pass
+
+
+class ProtocolRunHooks(RunHooksBase[TaskRuntimeContext, Agent[TaskRuntimeContext]]):
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper[TaskRuntimeContext],
+        agent: Agent[TaskRuntimeContext],
+        system_prompt: str | None,
+        input_items: list[Any],
+    ) -> None:
+        if context.context.loop_detected:
+            raise NoProgressLoopError(context.context.loop_reason or "NO_PROGRESS_LOOP")
+
+
+_INTERACTIVE_TAGS = {"a", "button", "input", "select", "textarea", "option", "summary", "details"}
+_INTERACTIVE_ROLES = {
+    "button",
+    "checkbox",
+    "combobox",
+    "link",
+    "listbox",
+    "menuitem",
+    "option",
+    "radio",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "textbox",
+}
+_ACTION_LABEL = re.compile(
+    r"(?:next|previous|prev|continue|more|search|submit|download|下一|上一|继续|更多|搜索|提交|下载)",
+    re.IGNORECASE,
+)
+
+
+def _task_terms(task: str) -> set[str]:
+    normalized = task.casefold()
+    terms = {token for token in re.findall(r"[a-z0-9][a-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", normalized)}
+    for sequence in re.findall(r"[\u4e00-\u9fff]{3,}", normalized):
+        terms.update(sequence[index : index + 2] for index in range(len(sequence) - 1))
+    return terms
+
+
+def _is_interactive(element: dict[str, Any]) -> bool:
+    return bool(
+        element.get("tag") in _INTERACTIVE_TAGS
+        or element.get("role") in _INTERACTIVE_ROLES
+        or element.get("href")
+        or element.get("type")
+    )
+
+
+def _compact_element(element: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {"bid": element["bid"], "tag": element.get("tag", "")}
+    limits = {"role": 80, "label": 180, "text": 240, "value": 160, "type": 60, "name": 100}
+    for key, limit in limits.items():
+        value = element.get(key)
+        if value not in (None, ""):
+            compact[key] = str(value)[:limit]
+    href = element.get("href")
+    if href:
+        compact["href"] = sanitize_url(str(href))[:300]
+    for key in ("checked", "selected"):
+        if element.get(key) is not None:
+            compact[key] = bool(element[key])
+    if element.get("disabled"):
+        compact["disabled"] = True
+    if element.get("visible") is False:
+        compact["visible"] = False
+    if element.get("shadow"):
+        compact["shadow"] = True
+    if element.get("frame"):
+        compact["frame"] = element["frame"]
+        if element.get("frame_url"):
+            compact["frame_url"] = sanitize_url(str(element["frame_url"]))[:300]
+    rect = element.get("rect")
+    if _is_interactive(element) and isinstance(rect, list) and len(rect) == 4:
+        compact["rect"] = rect
+    options = element.get("options")
+    if isinstance(options, list):
+        compact["options"] = [
+            {
+                key: str(option[key])[:160] if key != "selected" else bool(option[key])
+                for key in ("value", "label", "selected")
+                if key in option
+            }
+            for option in options[:40]
+            if isinstance(option, dict)
+        ]
+        if len(options) > 40:
+            compact["options_truncated"] = True
+    return compact
+
+
+def _project_observation(
+    result: dict[str, Any],
+    task: str,
+    *,
+    unchanged: bool,
+    max_elements: int = 120,
+    max_chars: int = 20_000,
+) -> dict[str, Any]:
+    terms = _task_terms(task)
+    candidates: list[tuple[int, int, dict[str, Any], bool, bool]] = []
+    frame_errors: list[dict[str, Any]] = []
+    for index, element in enumerate(result.get("elements", [])):
+        if not isinstance(element, dict) or not element.get("bid"):
+            if isinstance(element, dict) and element.get("frame_error"):
+                frame_errors.append(element)
+            continue
+        searchable = " ".join(
+            str(element.get(key, "")).casefold()
+            for key in ("text", "label", "name", "role", "tag", "href")
+        )
+        relevance = sum(1 for term in terms if term in searchable)
+        interactive = _is_interactive(element)
+        visible = element.get("visible") is not False
+        semantic = element.get("tag") in {"h1", "h2", "h3", "h4", "label", "th", "caption"}
+        action_label = bool(interactive and _ACTION_LABEL.search(searchable))
+        score = (
+            relevance * 100
+            + int(interactive) * 60
+            + int(visible) * 25
+            + int(semantic) * 15
+            + int(action_label) * 80
+        )
+        if not (interactive or semantic or relevance or visible):
+            continue
+        candidates.append((score, -index, element, interactive, visible))
+    candidates.sort(reverse=True, key=lambda value: (value[0], value[1]))
+
+    element_limit = min(max_elements, 24) if unchanged else max_elements
+    char_limit = min(max_chars, 6_000) if unchanged else max_chars
+    interactive_quota = min(60, max(1, element_limit // 2))
+    reserved = [candidate for candidate in candidates if candidate[3] and candidate[4]][:interactive_quota]
+    reserved_bids = {str(candidate[2].get("bid")) for candidate in reserved}
+    ordered_candidates = [
+        *reserved,
+        *(candidate for candidate in candidates if str(candidate[2].get("bid")) not in reserved_bids),
+    ]
+    projected: list[dict[str, Any]] = []
+    base = {
+        "url": result.get("url"),
+        "title": result.get("title"),
+        "dom_hash": result.get("dom_hash"),
+        "evidence_id": result.get("evidence_id"),
+        "unchanged": unchanged,
+        "bids_remain_valid": unchanged,
+        "total_element_count": len(result.get("elements", [])),
+        "source_truncated": bool(result.get("truncated")),
+        "frame_errors": frame_errors[:5],
+    }
+    for _, _, element, _, _ in ordered_candidates:
+        if len(projected) >= element_limit:
+            break
+        compact = _compact_element(element)
+        options = compact.get("options")
+        if isinstance(options, list):
+            low, high = 0, len(options)
+            while low < high:
+                middle = (low + high + 1) // 2
+                attempted = {
+                    **compact,
+                    "options": options[:middle],
+                    "options_truncated": middle < len(options) or compact.get("options_truncated", False),
+                }
+                candidate = {**base, "elements": [*projected, attempted]}
+                if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) <= char_limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            compact["options"] = options[:low]
+            if low < len(options):
+                compact["options_truncated"] = True
+            if low == 0:
+                compact.pop("options", None)
+        candidate = {**base, "elements": [*projected, compact]}
+        if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) > char_limit:
+            continue
+        projected.append(compact)
+    return {
+        **base,
+        "elements": projected,
+        "element_count": len(projected),
+        "elements_truncated_for_model": len(projected) < len(candidates),
+        "instruction": (
+            "DOM 未变化；以下 bid 已在本次观察中确认有效。不要继续重复 observe，按 bid 操作或用 extract 获取正文。"
+            if unchanged
+            else "这里只包含优先级最高的可见、可交互或任务相关元素；正文、列表和表格请用 extract 按需获取。"
+        ),
+    }
 
 
 def _json(value: Any, limit: int = 140_000) -> str:
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if len(text) <= limit:
         return text
+    metadata: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key in ("ok", "tool", "url", "evidence_id", "evidence_ids", "action_id", "accepted"):
+            if key in value:
+                metadata[key] = value[key]
+    base = {
+        "truncated_for_model": True,
+        "original_chars": len(text),
+        "instruction": "请缩小提取范围，或分批滚动/分页观察。完整证据仍保存在本地。",
+        **metadata,
+    }
+
+    def render(preview_chars: int) -> str:
+        return json.dumps(
+            {**base, "preview": text[:preview_chars]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    low, high = 0, min(len(text), limit)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(render(middle)) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    bounded = render(low)
+    if len(bounded) <= limit:
+        return bounded
     return json.dumps(
-        {
-            "truncated_for_model": True,
-            "original_chars": len(text),
-            "preview": text[:limit],
-            "instruction": "请缩小提取范围，或分批滚动/分页观察。完整证据仍保存在本地。",
-        },
+        {"truncated_for_model": True, "original_chars": len(text)},
         ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
@@ -204,7 +625,9 @@ async def _receipt_tool(
         result = await call
         ctx.context.record_receipt(result)
         ctx.context.thoughts.append(f"{name}: {'成功' if result.get('success') else '失败'}")
-        return _json(result)
+        if ctx.context.loop_detected:
+            result = {**result, "loop_guard": ctx.context.loop_reason}
+        return _json(result, limit=24_000)
     except Exception as exc:
         ctx.context.thoughts.append(f"{name}: 异常 {type(exc).__name__}")
         return _error(name, exc)
@@ -220,8 +643,11 @@ async def observe(ctx: RunContextWrapper[TaskRuntimeContext]) -> str:
             item["bid"]: item for item in result["elements"] if isinstance(item, dict) and item.get("bid")
         }
         ctx.context.visited_urls.append(result["url"])
-        model_result = {key: value for key, value in result.items() if key != "screenshot_path"}
-        return _json({"ok": True, **model_result})
+        unchanged = ctx.context.note_page_state(result["url"], result["dom_hash"])
+        model_result = _project_observation(result, ctx.context.contract.task, unchanged=unchanged)
+        if ctx.context.loop_detected:
+            model_result["loop_guard"] = ctx.context.loop_reason
+        return _json({"ok": True, **model_result}, limit=24_000)
     except Exception as exc:
         return _error("observe", exc)
 
@@ -294,6 +720,9 @@ async def tabs(
         result = await ctx.context.actor.tabs(action, index, url)
         for tab in result.get("tabs", []):
             ctx.context.visited_urls.append(tab["url"])
+        ctx.context.note_tab_state(result.get("tabs", []))
+        if ctx.context.loop_detected:
+            result["loop_guard"] = ctx.context.loop_reason
         return _json({"ok": True, **result})
     except Exception as exc:
         return _error("tabs", exc)
@@ -343,7 +772,8 @@ async def extract(
     """从页面或 bid 子树结构化提取文本、链接、表格或列表并生成证据。"""
     ctx.context.record_call("extract", {"kind": kind, "bid": bid, "limit": limit})
     try:
-        return _json({"ok": True, **(await ctx.context.actor.extract(kind, bid, limit))})
+        result = await ctx.context.actor.extract(kind, bid, limit)
+        return _json({"ok": True, "kind": kind, **result}, limit=24_000)
     except Exception as exc:
         return _error("extract", exc)
 
@@ -353,7 +783,11 @@ async def network(ctx: RunContextWrapper[TaskRuntimeContext], since_last: bool =
     """读取由当前浏览器页面真实触发的有界 XHR/Fetch 响应；敏感头已移除。"""
     ctx.context.record_call("network", {"since_last": since_last})
     try:
-        return _json({"ok": True, **(await ctx.context.actor.network_events(since_last))})
+        result = await ctx.context.actor.network_events(since_last)
+        return _json(
+            {"ok": True, "record_count": len(result.get("records", [])), **result},
+            limit=24_000,
+        )
     except Exception as exc:
         return _error("network", exc)
 
@@ -368,9 +802,98 @@ async def document(ctx: RunContextWrapper[TaskRuntimeContext], path: str) -> str
         result = await ctx.context.actor.extract_document(path)
         if not result.get("text", "").strip():
             ctx.context.scanned_document_paths.add(path)
-        return _json({"ok": True, **result})
+        return _json({"ok": True, **result}, limit=24_000)
     except Exception as exc:
         return _error("document", exc)
+
+
+def _evidence_page(payload: dict[str, Any], offset: int, limit: int) -> dict[str, Any]:
+    key = next((name for name in ("data", "records", "text") if name in payload), None)
+    if key is None:
+        raise ValueError("该证据不是 extract/network/document 的可分块内容")
+    content = payload[key]
+    if isinstance(content, list):
+        serialized_items = [
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str)
+            for item in content
+        ]
+        if any(len(item) > 18_000 for item in serialized_items):
+            serialized = "[" + ",".join(serialized_items) + "]"
+            char_limit = min(max(limit, 1), 12_000)
+            page_text = serialized[offset : offset + char_limit]
+            next_offset = offset + len(page_text)
+            return {
+                "unit": "char",
+                "encoding": "json",
+                "field": key,
+                "offset": offset,
+                "next_offset": next_offset if next_offset < len(serialized) else None,
+                "total": len(serialized),
+                "content": page_text,
+            }
+        item_limit = min(max(limit, 1), 200)
+        page = content[offset : offset + item_limit]
+        while len(page) > 1 and len(json.dumps(page, ensure_ascii=False, separators=(",", ":"))) > 18_000:
+            page.pop()
+        next_offset = offset + len(page)
+        return {
+            "unit": "item",
+            "field": key,
+            "offset": offset,
+            "next_offset": next_offset if next_offset < len(content) else None,
+            "total": len(content),
+            "content": page,
+        }
+    serialized = (
+        content
+        if isinstance(content, str)
+        else json.dumps(content, ensure_ascii=False, separators=(",", ":"), default=str)
+    )
+    char_limit = min(max(limit, 1), 12_000)
+    page_text = serialized[offset : offset + char_limit]
+    next_offset = offset + len(page_text)
+    return {
+        "unit": "char",
+        "field": key,
+        "offset": offset,
+        "next_offset": next_offset if next_offset < len(serialized) else None,
+        "total": len(serialized),
+        "content": page_text,
+    }
+
+
+@function_tool(timeout=5.0)
+async def recall_evidence(
+    ctx: RunContextWrapper[TaskRuntimeContext],
+    evidence_id: str,
+    offset: int = 0,
+    limit: int = 100,
+) -> str:
+    """按 evidence_id 分块回读本任务已采集的 extract/network/document 内容；不重新访问网页。"""
+    ctx.context.record_call(
+        "recall_evidence",
+        {"evidence_id": evidence_id, "offset": offset, "limit": limit},
+    )
+    evidence = ctx.context.evidence_store.get(evidence_id)
+    if evidence is None:
+        return _json({"ok": False, "error": "未知 evidence_id"})
+    if offset < 0:
+        return _json({"ok": False, "error": "offset 不得小于 0"})
+    try:
+        page = _evidence_page(evidence.payload, offset, limit)
+    except Exception as exc:
+        return _error("recall_evidence", exc)
+    return _json(
+        {
+            "ok": True,
+            "evidence_id": evidence.evidence_id,
+            "source": evidence.source,
+            "url": evidence.url,
+            "summary": evidence.summary,
+            **page,
+        },
+        limit=24_000,
+    )
 
 
 def _coverage_items(payload: dict[str, Any]) -> list[Any]:
@@ -397,6 +920,85 @@ def _coverage_items(payload: dict[str, Any]) -> list[Any]:
                         break
         return items
     return []
+
+
+async def _vision_completion(
+    context: TaskRuntimeContext,
+    messages: list[dict[str, Any]],
+) -> Any:
+    estimate = estimate_input_tokens(None, messages, [])
+    try:
+        reservation = (
+            await context.rate_limiter.acquire(estimate)
+            if context.rate_limiter is not None
+            else {"wait_seconds": 0.0, "reason": None}
+        )
+    except (ValueError, RuntimeError) as exc:
+        if context.usage_stats is not None:
+            context.usage_stats.record(
+                estimated_input_tokens=estimate,
+                wait_seconds=0.0,
+                throttle_reason=(
+                    "pre_send_tpm_lock_timeout"
+                    if isinstance(exc, RuntimeError)
+                    else "pre_send_request_exceeds_tpm_budget"
+                ),
+                usage=None,
+                error_type=type(exc).__name__,
+                channel="vision",
+            )
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if context.usage_stats is not None:
+            context.usage_stats.record(
+                estimated_input_tokens=estimate,
+                wait_seconds=0.0,
+                throttle_reason="pre_send_tpm_limiter_error",
+                usage=None,
+                error_type=type(exc).__name__,
+                channel="vision",
+            )
+        raise
+    try:
+        response = await context.vision_client.chat.completions.create(
+            model=context.vision_model,
+            messages=messages,
+            max_tokens=600,
+            **_kimi_request_options(context.vision_model),
+        )
+    except asyncio.CancelledError as exc:
+        if context.usage_stats is not None:
+            context.usage_stats.record(
+                estimated_input_tokens=estimate,
+                wait_seconds=reservation["wait_seconds"],
+                throttle_reason=reservation["reason"],
+                usage=None,
+                error_type=type(exc).__name__,
+                channel="vision",
+            )
+        raise
+    except Exception as exc:
+        if context.usage_stats is not None:
+            context.usage_stats.record(
+                estimated_input_tokens=estimate,
+                wait_seconds=reservation["wait_seconds"],
+                throttle_reason=reservation["reason"],
+                usage=None,
+                error_type=type(exc).__name__,
+                channel="vision",
+            )
+        raise
+    if context.usage_stats is not None:
+        context.usage_stats.record(
+            estimated_input_tokens=estimate,
+            wait_seconds=reservation["wait_seconds"],
+            throttle_reason=reservation["reason"],
+            usage=response.usage,
+            channel="vision",
+        )
+    return response
 
 
 @function_tool(timeout=5.0)
@@ -485,9 +1087,9 @@ async def visual_inspect(ctx: RunContextWrapper[TaskRuntimeContext], bid: str, q
     try:
         crop = await ctx.context.actor.visual_crop(bid, question)
         encoded = base64.b64encode(Path(crop["path"]).read_bytes()).decode("ascii")
-        response = await ctx.context.vision_client.chat.completions.create(
-            model=ctx.context.vision_model,
-            messages=[
+        response = await _vision_completion(
+            ctx.context,
+            [
                 {
                     "role": "user",
                     "content": [
@@ -496,8 +1098,6 @@ async def visual_inspect(ctx: RunContextWrapper[TaskRuntimeContext], bid: str, q
                     ],
                 }
             ],
-            max_tokens=600,
-            **_kimi_request_options(ctx.context.vision_model),
         )
         analysis = response.choices[0].message.content or ""
         evidence = ctx.context.evidence_store.add(
@@ -524,9 +1124,9 @@ async def visual_document(
     try:
         rendered = await ctx.context.actor.render_document_page(path, page_number, question)
         encoded = base64.b64encode(Path(rendered["path"]).read_bytes()).decode("ascii")
-        response = await ctx.context.vision_client.chat.completions.create(
-            model=ctx.context.vision_model,
-            messages=[
+        response = await _vision_completion(
+            ctx.context,
+            [
                 {
                     "role": "user",
                     "content": [
@@ -535,8 +1135,6 @@ async def visual_document(
                     ],
                 }
             ],
-            max_tokens=600,
-            **_kimi_request_options(ctx.context.vision_model),
         )
         analysis = response.choices[0].message.content or ""
         evidence = ctx.context.evidence_store.add(
@@ -648,6 +1246,7 @@ TOOLS = [
     extract,
     network,
     document,
+    recall_evidence,
     record_coverage,
     visual_inspect,
     visual_document,
@@ -675,8 +1274,19 @@ def _kimi_request_options(model: str) -> dict[str, Any]:
 
 
 class ProtocolIIIAgent:
-    def __init__(self, model: str, api_base: str, api_key: str, *, timeout_seconds: float = 180.0) -> None:
+    def __init__(
+        self,
+        model: str,
+        api_base: str,
+        api_key: str,
+        *,
+        timeout_seconds: float = 180.0,
+        rate_limiter: SharedTPMLimiter | None = None,
+        worker_id: int | None = None,
+    ) -> None:
         self.model_name = model
+        self.rate_limiter = rate_limiter
+        self.worker_id = worker_id
         self.client = AsyncOpenAI(
             base_url=api_base,
             api_key=api_key,
@@ -684,10 +1294,11 @@ class ProtocolIIIAgent:
             max_retries=0,
         )
         chat_model = OpenAIChatCompletionsModel(model=model, openai_client=self.client)
+        self.model = ThrottledModel(chat_model, rate_limiter)
         self.agent: Agent[TaskRuntimeContext] = Agent(
             name="WebRetriever Protocol III Agent",
             instructions=SYSTEM_INSTRUCTIONS,
-            model=chat_model,
+            model=self.model,
             tools=TOOLS,
             model_settings=_model_settings(model),
             tool_use_behavior=_verified_finish_behavior,
@@ -700,6 +1311,8 @@ class ProtocolIIIAgent:
         contract: TaskContract,
         evidence_store: EvidenceStore,
     ) -> dict[str, Any]:
+        usage_stats = TaskUsageStats(self.worker_id, contract.task_idx, contract.task_id)
+        self.model.usage_stats = usage_stats
         context = TaskRuntimeContext(
             actor=actor,
             contract=contract,
@@ -707,6 +1320,8 @@ class ProtocolIIIAgent:
             verifier=CompletionVerifier(),
             vision_client=self.client,
             vision_model=self.model_name,
+            usage_stats=usage_stats,
+            rate_limiter=self.rate_limiter,
         )
         try:
             await Runner.run(
@@ -714,6 +1329,7 @@ class ProtocolIIIAgent:
                 input=f"网站：{contract.website}\n任务：{contract.task}\n最大工具步数：{contract.max_steps}",
                 context=context,
                 max_turns=contract.max_steps,
+                hooks=ProtocolRunHooks(),
                 run_config=RunConfig(
                     tracing_disabled=True,
                     trace_include_sensitive_data=False,
@@ -724,12 +1340,17 @@ class ProtocolIIIAgent:
             )
             status = "SUCCESS" if context.finish_accepted else "FAIL_UNVERIFIED_FINISH"
             error = None
+        except NoProgressLoopError as exc:
+            status = "FAIL_NO_PROGRESS"
+            error = sanitize_exception(exc)
         except MaxTurnsExceeded:
             status = "FAIL_MAX_STEPS"
             error = f"达到 Protocol III 最大步数 {contract.max_steps}，且没有通过验证的 finish"
         except Exception as exc:
             status = "FAIL_AGENT_ERROR"
             error = sanitize_exception(exc)
+        finally:
+            self.model.usage_stats = None
         return {
             "status": status,
             "agent_answer": context.final_answer if status == "SUCCESS" else None,
@@ -741,5 +1362,6 @@ class ProtocolIIIAgent:
             "urls": list(dict.fromkeys(context.visited_urls)),
             "receipts": [receipt.to_dict() for receipt in context.receipts],
             "predict_length": context.tool_steps,
+            "model_usage": usage_stats.to_dict(),
             "error": error,
         }

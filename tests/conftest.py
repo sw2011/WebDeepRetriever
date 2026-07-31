@@ -183,6 +183,13 @@ PAGES: dict[str, str] = {
     </body></html>""",
 }
 
+PAGES["/large-dom"] = (
+    f"<!doctype html><html><head><title>Large DOM</title>{BASE_STYLE}</head><body>"
+    + "".join(f"<p>Audit row {index} {'x' * 120}</p>" for index in range(1_200))
+    + '<button id="critical">Download critical metric</button>'
+    + "</body></html>"
+)
+
 
 class FixtureHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

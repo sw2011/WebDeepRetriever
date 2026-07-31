@@ -138,6 +138,8 @@ cp .env.example .env
 | `OPENAI_API_KEY` | 是 | 模型 API 密钥 |
 | `OPENAI_BASE_URL` | 否 | OpenAI 兼容 API 地址，默认 `https://api.openai.com/v1` |
 | `WEBRETRIEVER_MODEL` | 否 | 模型名称，默认 `gpt-4.1-mini` |
+| `MOONSHOT_TPM_LIMIT` | 否 | `kimi-k2.6` 组织级 TPM 上限，默认 `3000000` |
+| `MOONSHOT_TPM_SAFETY_RATIO` | 否 | `kimi-k2.6` 跨 Worker 预发送安全比例，默认 `0.8` |
 | `WEBRETRIEVER_CDP_URLS` | 是 | 1 到 8 个互不相同的 CDP URL，以英文逗号分隔 |
 | `WEBRETRIEVER_MAX_STEPS` | 否 | 单任务最大工具步数，运行时限制为 1 到 100 |
 | `WEBRETRIEVER_UPLOAD_ROOTS` | 否 | 允许上传的目录白名单 |
@@ -171,7 +173,7 @@ export WEBRETRIEVER_CDP_URLS='http://127.0.0.1:9222'
 bash scripts/run_agent.sh
 ```
 
-并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
+并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。`kimi-k2.6` 的所有 Worker 共享同一滑动 TPM 窗口，达到安全线时会在请求发送前等待，该等待不属于 API 重试；OpenAI 客户端仍保持 `max_retries=0`。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
 
 健康检查只验证安装和入口，不探测浏览器、模型或网站：
 
@@ -251,7 +253,7 @@ output/
     └── summary.json
 ```
 
-`result.json` 保存 `agent_answer`、状态、动作、动作执行摘要、访问 URL、动作回执、证据绑定和覆盖证书。`capture.json` 记录本任务所有已附加页面通过浏览器触发的有界 XHR/Fetch，并对敏感字段脱敏。
+`result.json` 保存 `agent_answer`、状态、动作、动作执行摘要、访问 URL、动作回执、证据绑定、覆盖证书和逐请求 `model_usage`。`logs/summary.json` 汇总任务/Worker 的实际 token、保守输入估算、预发送等待时间和限流原因；这些记录不包含提示词、工具正文、密钥或请求 ID。`capture.json` 记录本任务所有已附加页面通过浏览器触发的有界 XHR/Fetch，并对敏感字段脱敏。
 
 主要状态：
 
@@ -259,6 +261,7 @@ output/
 | --- | --- |
 | `SUCCESS` | `finish` 已通过完成契约和证据结构验证；不代表答案语义正确 |
 | `FAIL_MAX_STEPS` | 达到最大工具步数且没有通过验证的 `finish` |
+| `FAIL_NO_PROGRESS` | 连续重复已见页面/标签状态或无变化动作，循环保护在下一次模型请求前终止任务 |
 | `FAIL_UNVERIFIED_FINISH` | Agent 结束，但没有获得验证通过的 `finish` |
 | `FAIL_AGENT_ERROR` | 模型调用或 Agent 工具循环失败 |
 | `FAIL_BROWSER_ERROR` | CDP 连接、任务页面初始化等浏览器启动阶段失败 |

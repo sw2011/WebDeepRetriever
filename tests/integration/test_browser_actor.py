@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 import time
@@ -8,14 +9,67 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from agents.tool_context import ToolContext
+from openai import AsyncOpenAI
 from PIL import Image
 
 from web_agent.browser_actor import BrowserActor
+from web_agent.contracts import TaskContract
+from web_agent.runtime import TaskRuntimeContext, observe as observe_tool
+from web_agent.verifier import CompletionVerifier
 
 from conftest import one_element
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+async def test_large_dom_model_projection_repeat_and_full_audit(actor_factory: Any) -> None:
+    actor: BrowserActor = await actor_factory("/large-dom")
+    context = TaskRuntimeContext(
+        actor=actor,
+        contract=TaskContract.from_item(
+            {
+                "task_idx": 1,
+                "task_id": "large",
+                "website": "https://example.test",
+                "task": "Download critical metric",
+            }
+        ),
+        evidence_store=actor.evidence_store,
+        verifier=CompletionVerifier(),
+        vision_client=AsyncOpenAI(api_key="test", base_url="http://127.0.0.1:9/v1", max_retries=0),
+        vision_model="test",
+    )
+
+    first_text = await observe_tool.on_invoke_tool(
+        ToolContext(context, tool_name="observe", tool_call_id="1", tool_arguments="{}"),
+        "{}",
+    )
+    first = json.loads(first_text)
+    assert first["total_element_count"] >= 1_200
+    assert first["element_count"] <= 120
+    assert len(first_text) <= 24_000
+    critical = next(item for item in first["elements"] if item.get("text") == "Download critical metric")
+
+    second_text = await observe_tool.on_invoke_tool(
+        ToolContext(context, tool_name="observe", tool_call_id="2", tool_arguments="{}"),
+        "{}",
+    )
+    second = json.loads(second_text)
+    assert second["unchanged"] is True
+    assert second["bids_remain_valid"] is True
+    assert len(second["elements"]) <= 24
+    assert any(item["bid"] == critical["bid"] for item in second["elements"])
+    assert (await actor.click(critical["bid"]))["success"] is True
+
+    artifacts = sorted((actor.output_dir / "observations").glob("*.json.gz"))
+    assert len(artifacts) == 2
+    with gzip.open(artifacts[-1], "rt", encoding="utf-8") as source:
+        audit = json.load(source)
+    assert len(audit["elements"]) == second["total_element_count"]
+    assert audit["dom_hash"] == second["dom_hash"]
+    assert "dom_snapshot" in audit and "ax_tree" in audit
 
 
 async def test_native_custom_form_duplicate_labels_stale_bid_and_spa(

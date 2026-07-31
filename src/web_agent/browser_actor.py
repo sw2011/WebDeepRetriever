@@ -88,7 +88,8 @@ _MARK_AND_COLLECT = r"""
         disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
         href: el.href || '', type: el.type || '', name: el.name || '',
         rect: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
-        visible: rect.width > 0 && rect.height > 0,
+        visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+          rect.top < window.innerHeight && rect.left < window.innerWidth,
         shadow: Boolean(el.getRootNode() instanceof ShadowRoot),
       };
       if (el.tagName === 'SELECT') {
@@ -492,7 +493,19 @@ class BrowserActor:
         dom_hash = self._dom_hash()
         artifact = self.output_dir / "observations" / f"{self._step_counter - 1:03d}.json.gz"
         with gzip.open(artifact, "wt", encoding="utf-8") as output:
-            json.dump({"dom_snapshot": raw_snapshot, "ax_tree": ax_tree}, output, ensure_ascii=False)
+            json.dump(
+                {
+                    "url": sanitize_url(self._page.url),
+                    "title": self._page.title(),
+                    "dom_hash": dom_hash,
+                    "elements": elements,
+                    "elements_truncated": truncated,
+                    "dom_snapshot": raw_snapshot,
+                    "ax_tree": ax_tree,
+                },
+                output,
+                ensure_ascii=False,
+            )
         payload = {
             "title": self._page.title(),
             "dom_hash": dom_hash,
@@ -559,11 +572,15 @@ class BrowserActor:
 
     def _fill_op(self, bid: str, value: str) -> dict[str, Any]:
         locator = self._locator(bid)
+        before = locator.input_value()
         locator.fill(value, timeout=self.click_timeout_ms)
         is_password = (locator.get_attribute("type") or "").casefold() == "password"
+        after = locator.input_value()
         return {
-            "value": "[REDACTED]" if is_password else locator.input_value(),
+            "before_value": "[REDACTED]" if is_password else before,
+            "value": "[REDACTED]" if is_password else after,
             "expected_value": "[REDACTED]" if is_password else value,
+            "value_changed": before != after,
         }
 
     async def select(self, bid: str, values: list[str]) -> dict[str, Any]:
@@ -571,8 +588,16 @@ class BrowserActor:
 
     def _select_op(self, bid: str, values: list[str]) -> dict[str, Any]:
         locator = self._locator(bid)
+        before = locator.input_value()
         selected = locator.select_option(values, timeout=self.click_timeout_ms)
-        return {"selected": selected, "requested": values, "value": locator.input_value()}
+        after = locator.input_value()
+        return {
+            "selected": selected,
+            "requested": values,
+            "before_value": before,
+            "value": after,
+            "value_changed": before != after,
+        }
 
     async def set_checked(self, bid: str, checked: bool) -> dict[str, Any]:
         return await self._call(
@@ -581,8 +606,15 @@ class BrowserActor:
 
     def _set_checked_op(self, bid: str, checked: bool) -> dict[str, Any]:
         locator = self._locator(bid)
+        before = locator.is_checked()
         locator.set_checked(checked, timeout=self.click_timeout_ms)
-        return {"checked": locator.is_checked(), "expected_checked": checked}
+        after = locator.is_checked()
+        return {
+            "before_checked": before,
+            "checked": after,
+            "expected_checked": checked,
+            "value_changed": before != after,
+        }
 
     async def press(self, key: str, bid: str | None = None) -> dict[str, Any]:
         return await self._call(self._action_sync, "press", lambda: self._press_op(key, bid), bid)
