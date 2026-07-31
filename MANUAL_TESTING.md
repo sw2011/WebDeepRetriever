@@ -158,7 +158,7 @@ OPENAI_API_KEY='替换为实际密钥' \
 - `trajectory/` 与 `trajectory_visual/`：逐步审计截图。
 - `capture.json`：只包含页面通过浏览器触发的有界 XHR/Fetch，敏感头和字段应脱敏。
 - `actions`、`thoughts`、`urls`、回执与证据：位于结果或相应审计文件中，且答案字段需绑定访问过 URL 的证据。
-- “全部/完整/列出”等任务：必须有可验证的 `coverage`，并证明下一页、游标、声明总数或虚拟列表已经终止。
+- “全部/完整/列出”等任务：必须先由 `record_coverage` 基于真实证据签发短 `coverage_id`，`finish` 只引用该 handle；落盘证书需证明下一页、游标、声明总数或虚拟列表已经终止。
 
 可用下面的只读检查统计输出，命令不会访问网站：
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import queue as queue_module
 import tempfile
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -60,11 +62,24 @@ def is_completed(path: Path) -> bool:
     return result.get("status") == "SUCCESS" and bool(result.get("agent_answer"))
 
 
+def _distribution(values: list[float | int]) -> dict[str, float | int | None]:
+    if not values:
+        return {"p50": None, "p95": None, "max": None}
+    ordered = sorted(values)
+
+    def percentile(fraction: float) -> float | int:
+        return ordered[max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))]
+
+    return {"p50": percentile(0.50), "p95": percentile(0.95), "max": ordered[-1]}
+
+
 def _aggregate_usage(items: list[dict[str, Any]]) -> dict[str, Any]:
     usages = [item.get("model_usage", {}) for item in items]
     reasons: Counter[str] = Counter()
     for usage in usages:
         reasons.update(usage.get("throttle_reasons", {}))
+    requests = [request for usage in usages for request in usage.get("requests", [])]
+    available_inputs = [int(request["input_tokens"]) for request in requests if request.get("input_tokens") is not None]
     return {
         "task_count": len(usages),
         "request_count": sum(int(usage.get("request_count", 0)) for usage in usages),
@@ -78,6 +93,11 @@ def _aggregate_usage(items: list[dict[str, Any]]) -> dict[str, Any]:
             sum(float(usage.get("throttle_wait_seconds", 0.0)) for usage in usages), 3
         ),
         "throttle_reasons": dict(sorted(reasons.items())),
+        "request_count_per_task": _distribution([int(usage.get("request_count", 0)) for usage in usages]),
+        "input_tokens_per_request": _distribution(available_inputs),
+        "serialized_context_bytes_per_request": _distribution(
+            [int(request.get("serialized_context_bytes", 0)) for request in requests]
+        ),
     }
 
 
@@ -97,7 +117,7 @@ def _kimi_tpm_budget(model: str) -> int | None:
 async def _worker_async(
     config: WorkerConfig,
     items: list[dict[str, Any]],
-    rate_limit_state: tuple[Any, Any, int, float] | None = None,
+    rate_limit_state: tuple[Any, Any, int, float, Any] | None = None,
 ) -> list[dict[str, Any]]:
     output_root = Path(config.output_dir)
     placeholder_store = EvidenceStore()
@@ -108,6 +128,7 @@ async def _worker_async(
             rate_limit_state[1],
             token_budget=rate_limit_state[2],
             window_seconds=rate_limit_state[3],
+            calibration_samples=rate_limit_state[4],
         )
         if rate_limit_state is not None
         else None
@@ -122,6 +143,7 @@ async def _worker_async(
     summaries: list[dict[str, Any]] = []
     try:
         for item in items:
+            task_started = time.monotonic()
             contract = TaskContract.from_item(item, config.max_steps)
             task_dir = task_directory(output_root, item)
             task_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +180,7 @@ async def _worker_async(
                     },
                     "error": sanitize_exception(exc),
                 }
+            run_result["duration_seconds"] = round(time.monotonic() - task_started, 3)
             try:
                 await actor.flush_artifacts()
             except Exception as exc:
@@ -181,6 +204,7 @@ async def _worker_async(
                     "agent_answer": result.get("agent_answer"),
                     "error": result.get("error"),
                     "model_usage": result.get("model_usage", {}),
+                    "duration_seconds": result.get("duration_seconds", 0.0),
                 }
             )
     finally:
@@ -192,7 +216,7 @@ def worker_entry(
     config_dict: dict[str, Any],
     items: list[dict[str, Any]],
     queue: Any,
-    rate_limit_state: tuple[Any, Any, int, float] | None = None,
+    rate_limit_state: tuple[Any, Any, int, float, Any] | None = None,
 ) -> None:
     config = WorkerConfig(**config_dict)
     log_dir = Path(config.output_dir) / "logs"
@@ -252,6 +276,7 @@ def run_tasks(
             "pending": 0,
             "completed": 0,
             "model_usage": _aggregate_usage([]),
+            "task_duration_seconds": _distribution([]),
             "workers": [],
         }
         atomic_write_json(output_dir / "logs" / "summary.json", summary)
@@ -269,7 +294,7 @@ def run_tasks(
         queue = context.Queue()
         manager = context.Manager() if tpm_budget is not None else None
         rate_limit_state = (
-            (manager.list(), manager.RLock(), tpm_budget, 60.0)
+            (manager.list(), manager.RLock(), tpm_budget, 60.0, manager.list())
             if manager is not None and tpm_budget is not None
             else None
         )
@@ -347,6 +372,9 @@ def run_tasks(
         "failed": sum(item["status"] != "SUCCESS" for item in summaries),
         "tpm_safety_budget": tpm_budget,
         "model_usage": _aggregate_usage(summaries),
+        "task_duration_seconds": _distribution(
+            [float(item.get("duration_seconds", 0.0)) for item in summaries]
+        ),
         "workers": worker_results,
     }
     atomic_write_json(output_dir / "logs" / "summary.json", summary)

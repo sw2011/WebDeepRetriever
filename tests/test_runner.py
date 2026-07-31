@@ -4,7 +4,14 @@ import json
 
 import pytest
 
-from web_agent.runner import _aggregate_usage, _kimi_tpm_budget, atomic_write_json, is_completed, task_directory
+from web_agent.runner import (
+    _aggregate_usage,
+    _distribution,
+    _kimi_tpm_budget,
+    atomic_write_json,
+    is_completed,
+    task_directory,
+)
 
 
 def test_result_resume_requires_verified_answer(tmp_path) -> None:
@@ -96,6 +103,14 @@ def test_usage_aggregation_preserves_task_worker_totals_and_throttle_reasons() -
     assert summary["request_count"] == 3
     assert summary["input_tokens"] == 150
     assert summary["throttle_reasons"] == {"pre_send_tpm_capacity": 1}
+    assert summary["request_count_per_task"] == {"p50": 1, "p95": 2, "max": 2}
+
+
+def test_summary_distribution_reports_p50_p95_and_max() -> None:
+    assert _distribution(list(range(1, 101))) == {"p50": 50, "p95": 95, "max": 100}
+    assert _distribution([1, 100]) == {"p50": 1, "p95": 100, "max": 100}
+    assert _distribution(list(range(1, 9))) == {"p50": 4, "p95": 8, "max": 8}
+    assert _distribution([]) == {"p50": None, "p95": None, "max": None}
 
 
 def test_worker_start_failure_cleans_up_started_process_and_queue(tmp_path, monkeypatch) -> None:

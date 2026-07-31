@@ -123,7 +123,7 @@ class CoverageCertificate:
 
 
 _COVERAGE_PATTERNS = re.compile(
-    r"(?:全部|所有|完整|列出|分别|每(?:个|项)|全[部量]|top\s*\d+|前\s*\d+|排名|共有多少|总数|哪些)",
+    r"(?:全部|所有|完整|列出|分别|每(?:个|项)|全[部量]|top\s*(?!\d+\s*%)\d+|前\s*(?:\d+|[一二三四五六七八九十]+)(?:个|项)?|哪\s*(?:\d+|[一二三四五六七八九十]+)\s*个|排名|共有多少|总数|哪些|\bhow\s+many\b|\bwhich\b[^?.]{0,80}\b(?:are|were|have|contain|include)\b|\blist\s+all\b|\btotal\s+number\b|\bevery\b)",
     re.IGNORECASE,
 )
 _FORM_PATTERNS = re.compile(

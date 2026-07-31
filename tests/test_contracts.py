@@ -43,6 +43,15 @@ def test_contract_caps_protocol_steps_and_infers_obligations() -> None:
     assert value.requires_coverage is True
     assert value.requires_form_confirmation is True
 
+    english = TaskContract.from_item(
+        {"task_idx": 2, "task_id": "e", "website": "example.test", "task": "How many records are there?"}
+    )
+    assert english.requires_coverage is True
+
+    assert contract("Which year had the highest revenue?").requires_coverage is False
+    assert contract("Which companies are included in the index?").requires_coverage is True
+    assert contract("Indicator=Top 10% income share, Year=2010; what is the value (%)?").requires_coverage is False
+
 
 def test_verifier_rejects_empty_unknown_and_unvisited_evidence() -> None:
     store = EvidenceStore()

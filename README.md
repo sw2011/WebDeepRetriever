@@ -10,7 +10,8 @@ WebDeepRetriever 是一套可审计、可并发、可验证完成状态的网页
 - 基于 BrowserGym DOM/AX 观察生成稳定 `bid`，使用 Locator 执行点击、填写、选择、滚动、上传、下载和标签页操作，不提供坐标点击入口。
 - 采集页面结构、浏览器真实触发的有界 XHR/Fetch、下载文档和动作回执；只有结构化信息不足时才允许局部视觉降级。
 - 由 `CompletionVerifier` 校验答案非空、证据引用、字段绑定、表单确认和全量任务覆盖证明；只有完成契约通过验证的 `finish` 才会产生 `SUCCESS`。
-- 每个任务最多 100 个工具步骤，模型请求零重试；`result.json`、`evidence.json` 和汇总文件采用临时文件替换写入，已完成任务可断点续跑。
+- 每个任务采用“基础 30 次模型请求 + 可证明进展信用”的自适应预算，绝对上限 60；用户配置的 100 步仍作为外层安全配置，模型请求零重试。
+- 统一进展账本检测周期 1 到 4 的状态/动作循环，并熔断重复 finish、extract、recall 和同 URL 新标签；`extract_many` 可在一次请求内顺序完成最多 8 项同页提取。
 - 提供 Protocol III 数据剖析、确定性分层抽样，以及 exact/normalized 离线答案对比。
 - 对 URL、凭据、错误和网络证据进行有界记录与脱敏。
 
@@ -38,7 +39,7 @@ flowchart LR
 | --- | --- |
 | `src/web_agent/cli.py` | 命令行参数、环境变量和健康检查入口 |
 | `src/web_agent/runner.py` | 多进程分片、每个 CDP 一个 Worker、断点续跑和结果汇总 |
-| `src/web_agent/runtime.py` | 模型工具循环、上下文裁剪、工具步数限制、Kimi K2.6 参数兼容 |
+| `src/web_agent/runtime.py` | 模型工具循环、工作记忆 checkpoint、进展账本、自适应预算和完成协议 |
 | `src/web_agent/browser_actor.py` | CDP 连接、DOM/AX 观察、页面动作、网络/文档/视觉证据和审计产物 |
 | `src/web_agent/contracts.py` | 任务契约、动作回执、证据引用和覆盖证书 |
 | `src/web_agent/verifier.py` | 完成条件与证据一致性验证 |
@@ -141,7 +142,7 @@ cp .env.example .env
 | `MOONSHOT_TPM_LIMIT` | 否 | `kimi-k2.6` 组织级 TPM 上限，默认 `3000000` |
 | `MOONSHOT_TPM_SAFETY_RATIO` | 否 | `kimi-k2.6` 跨 Worker 预发送安全比例，默认 `0.8` |
 | `WEBRETRIEVER_CDP_URLS` | 是 | 1 到 8 个互不相同的 CDP URL，以英文逗号分隔 |
-| `WEBRETRIEVER_MAX_STEPS` | 否 | 单任务最大工具步数，运行时限制为 1 到 100 |
+| `WEBRETRIEVER_MAX_STEPS` | 否 | 外层单任务安全配置，允许 1 到 100；实际模型请求由自适应预算控制且不超过 60 |
 | `WEBRETRIEVER_UPLOAD_ROOTS` | 否 | 允许上传的目录白名单 |
 | `WEBRETRIEVER_INPUT_HOST` | Compose 必填 | 宿主机任务 JSON 路径 |
 | `WEBRETRIEVER_OUTPUT_HOST` | 否 | Compose 宿主机输出目录，默认 `./output` |
@@ -173,7 +174,7 @@ export WEBRETRIEVER_CDP_URLS='http://127.0.0.1:9222'
 bash scripts/run_agent.sh
 ```
 
-并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。`kimi-k2.6` 的所有 Worker 共享同一滑动 TPM 窗口，达到安全线时会在请求发送前等待，该等待不属于 API 重试；OpenAI 客户端仍保持 `max_retries=0`。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
+并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。`kimi-k2.6` 的所有 Worker 共享同一滑动 TPM 窗口和按通道校准样本：冷启动按真实运行高分位保守预约，usage 返回后用实际输入 token 原子 reconcile；达到安全线时会在发送前等待，该等待不属于 API 重试，OpenAI 客户端仍保持 `max_retries=0`。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
 
 健康检查只验证安装和入口，不探测浏览器、模型或网站：
 
@@ -253,15 +254,15 @@ output/
     └── summary.json
 ```
 
-`result.json` 保存 `agent_answer`、状态、动作、动作执行摘要、访问 URL、动作回执、证据绑定、覆盖证书和逐请求 `model_usage`。`logs/summary.json` 汇总任务/Worker 的实际 token、保守输入估算、预发送等待时间和限流原因；这些记录不包含提示词、工具正文、密钥或请求 ID。`capture.json` 记录本任务所有已附加页面通过浏览器触发的有界 XHR/Fetch，并对敏感字段脱敏。
+`result.json` 保存 `agent_answer`、状态、动作、进展原因、访问 URL、动作回执、证据绑定、服务端覆盖证书和逐请求 `model_usage`。模型只接触 `record_coverage` 返回的短 `coverage_id`。`logs/summary.json` 汇总请求数、任务耗时、实际输入 token 的 p50/p95/max，以及预发送等待与限流原因；逐请求记录上下文字节分类、语义状态、缓存/循环计数和模型/工具/浏览器延迟，且不包含提示词正文、密钥或请求 ID。`capture.json` 记录本任务所有已附加页面通过浏览器触发的有界 XHR/Fetch，并对敏感字段脱敏。
 
 主要状态：
 
 | 状态 | 含义 |
 | --- | --- |
 | `SUCCESS` | `finish` 已通过完成契约和证据结构验证；不代表答案语义正确 |
-| `FAIL_MAX_STEPS` | 达到最大工具步数且没有通过验证的 `finish` |
-| `FAIL_NO_PROGRESS` | 连续重复已见页面/标签状态或无变化动作，循环保护在下一次模型请求前终止任务 |
+| `FAIL_MAX_STEPS` | 达到 60 次绝对模型请求上限且没有通过验证的 `finish` |
+| `FAIL_NO_PROGRESS` | 重复调用、周期循环、无新信息或自适应预算耗尽，保护在下一次模型请求前终止任务 |
 | `FAIL_UNVERIFIED_FINISH` | Agent 结束，但没有获得验证通过的 `finish` |
 | `FAIL_AGENT_ERROR` | 模型调用或 Agent 工具循环失败 |
 | `FAIL_BROWSER_ERROR` | CDP 连接、任务页面初始化等浏览器启动阶段失败 |

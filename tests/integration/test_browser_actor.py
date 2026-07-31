@@ -139,10 +139,15 @@ async def test_nested_iframe_and_open_shadow_dom(actor_factory: Any) -> None:
 
     shadow_input = one_element(observation, tag="input", name="shadow-value")
     assert shadow_input["shadow"] is True
-    assert (await actor.fill(shadow_input["bid"], "inside-shadow"))["success"]
+    filled = await actor.fill(shadow_input["bid"], "inside-shadow")
+    assert filled["success"]
     shadow_button = one_element(observation, tag="button", text="Save shadow")
     assert shadow_button["shadow"] is True
-    assert (await actor.click(shadow_button["bid"]))["success"]
+    saved = await actor.click(shadow_button["bid"])
+    assert saved["success"]
+    assert saved["postconditions"]["before_semantic_page_fingerprint"] != saved["postconditions"][
+        "after_semantic_page_fingerprint"
+    ]
     updated = await actor.observe()
     shadow_result = one_element(updated, text="Shadow saved")
     assert shadow_result["shadow"] is True
@@ -256,6 +261,14 @@ async def test_canvas_image_dialog_and_new_tab(actor_factory: Any) -> None:
     original_index = next(tab["index"] for tab in tabs["tabs"] if tab["url"].endswith("/visual-tabs"))
     switched = await actor.tabs("switch", original_index)
     assert next(tab for tab in switched["tabs"] if tab["active"])["url"].endswith("/visual-tabs")
+    reused = await actor.tabs("new", url=next(tab["url"] for tab in switched["tabs"] if tab["active"]))
+    assert reused["reused"] is True
+    assert len(reused["tabs"]) == 2
+    route_a = await actor.tabs("new", url=f"{reused['tabs'][0]['url']}#/route-a")
+    route_b = await actor.tabs("new", url=f"{reused['tabs'][0]['url']}#/route-b")
+    assert route_a["reused"] is False
+    assert route_b["reused"] is False
+    assert len(route_b["tabs"]) == 4
 
 
 async def test_upload_download_pdf_document_and_browser_network(
@@ -360,6 +373,11 @@ async def test_browser_actor_serializes_playwright_on_owner_thread(actor_factory
     visual_trajectory = sorted((actor.output_dir / "trajectory_visual").glob("[0-9]*.png"))
     assert len(trajectory) >= 5  # start + observe + three action receipts
     assert [path.name for path in trajectory] == [path.name for path in visual_trajectory]
+    assert all(
+        raw.stat().st_ino == (actor.output_dir / "trajectory_visual" / raw.name).stat().st_ino
+        or raw.read_bytes() == (actor.output_dir / "trajectory_visual" / raw.name).read_bytes()
+        for raw in trajectory
+    )
 
 
 async def test_page_crash_fails_fast_without_success_receipt(actor_factory: Any) -> None:
@@ -388,3 +406,25 @@ async def test_cdp_disconnect_fails_fast_without_success_receipt(actor_factory: 
     assert elapsed < 2
     assert receipt["success"] is False
     assert receipt["error"]
+
+
+async def test_volatile_clock_changes_raw_hash_but_not_semantic_state(actor_factory: Any) -> None:
+    actor: BrowserActor = await actor_factory("/thread")
+    await actor._call(
+        actor._page.evaluate,
+        """() => {
+          const p=document.createElement('p'); p.id='clock'; p.textContent='Updated 2026-07-31T17:10:11.123Z'; document.body.appendChild(p);
+          const hidden=document.createElement('div'); hidden.style.display='none'; hidden.innerHTML='<p id="hidden-noise">Hidden 1</p>'; document.body.appendChild(hidden);
+        }""",
+    )
+    first = await actor.observe()
+    await actor._call(
+        actor._page.evaluate,
+        """() => {
+          document.getElementById('clock').textContent='Updated 2026-07-31T17:59:59.999Z';
+          document.getElementById('hidden-noise').textContent='Hidden 999999';
+        }""",
+    )
+    second = await actor.observe()
+    assert first["dom_hash"] != second["dom_hash"]
+    assert first["semantic_page_fingerprint"] == second["semantic_page_fingerprint"]

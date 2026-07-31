@@ -7,7 +7,7 @@
 - 正式容器只接收比赛方提供的外部 CDP URL；镜像不下载、不安装、不启动浏览器。
 - 所有浏览器连接与交互都经 Playwright，禁止裸 CDP 客户端、`cdp-use`、UI-TARS、AnySearch、外部搜索引擎及绕过网页的主动 HTTP/API 请求。
 - 每个 CDP URL 固定分配一个 BrowserActor worker。URL 数量必须为 1 到 8 且互不相同。
-- 单任务工具步数强制限制在 1 到 100；模型单次请求上限由运行时设置为 180 秒。
+- `max_steps` 外层配置限制在 1 到 100；实际采用基础 30 次模型请求加可证明进展信用，绝对不超过 60；模型单次请求上限为 180 秒。
 - 上传仅允许任务输出父目录或 `WEBRETRIEVER_UPLOAD_ROOTS` 白名单；Compose 默认只额外允许只读输入目录。
 - `output` 必须持久化；正式结果以各任务 `result.json.agent_answer` 和 CompletionVerifier 状态为准。
 
@@ -107,7 +107,7 @@ cd /Users/admin/Desktop/webRetriever/WebDeepRetriever
 - `trajectory/`、`trajectory_visual/`、`capture.json`；
 - actions、thoughts、urls、动作回执、证据和 worker 日志。
 
-进程退出不等于任务成功。浏览器断开、页面崩溃、100 步耗尽、非法工具输出和 CompletionVerifier 拒绝都必须保留失败状态，不能产生未经验证的 SUCCESS。
+进程退出不等于任务成功。浏览器断开、页面崩溃、自适应预算或 60 次硬上限耗尽、非法工具输出和 CompletionVerifier 拒绝都必须保留失败状态，不能产生未经验证的 SUCCESS。
 
 ## Protocol III 离线报告
 

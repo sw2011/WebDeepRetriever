@@ -12,7 +12,7 @@ from agents.tool_context import ToolContext
 from agents.run_config import CallModelData, ModelInputData
 from openai import AsyncOpenAI
 
-from web_agent.contracts import TaskContract
+from web_agent.contracts import CoverageCertificate, TaskContract
 from web_agent.evidence import EvidenceStore
 from web_agent.runtime import (
     TOOLS,
@@ -22,15 +22,24 @@ from web_agent.runtime import (
     ProtocolIIIAgent,
     TaskRuntimeContext,
     _coverage_items,
+    _answer_shape_reasons,
     _error,
     _json,
     _kimi_request_options,
     _model_settings,
     _project_observation,
+    _tool_failure,
     _verified_finish_behavior,
     _vision_completion,
 )
-from web_agent.token_control import SharedTPMLimiter, TaskUsageStats, ThrottledModel, estimate_input_tokens
+from web_agent.token_control import (
+    MAX_SERIALIZED_CONTEXT_BYTES,
+    SharedTPMLimiter,
+    TaskUsageStats,
+    ThrottledModel,
+    estimate_input_tokens,
+    model_input_metrics,
+)
 from web_agent.verifier import CompletionVerifier
 
 
@@ -74,6 +83,7 @@ def test_all_function_tools_have_strict_closed_schemas() -> None:
         "upload",
         "download",
         "extract",
+        "extract_many",
         "network",
         "document",
         "recall_evidence",
@@ -106,9 +116,9 @@ def test_kimi_k26_uses_tool_compatible_settings() -> None:
     assert agent.client.max_retries == 0
 
 
-def test_hard_step_limit_rejects_call_101() -> None:
+def test_hard_step_limit_rejects_call_61() -> None:
     context = make_context(100)
-    for index in range(100):
+    for index in range(60):
         context.record_call("observe", {"index": index})
     with pytest.raises(RuntimeError, match="STEP_LIMIT"):
         context.record_call("observe", {})
@@ -157,11 +167,12 @@ def test_single_user_run_keeps_only_latest_observation_and_summarizes_evidence()
     filtered = BoundedToolOutputFilter(keep_recent_outputs=2, old_output_chars=100)(
         CallModelData(model_data=model_data, agent=SimpleNamespace(), context=None)  # type: ignore[arg-type]
     )
-    outputs = [item["output"] for item in filtered.input if isinstance(item, dict) and item.get("type") == "function_call_output"]
-    assert sum("compacted_tool_output" in str(output) for output in outputs) == 9
-    assert "compacted_tool_output" not in str(outputs[-1])
-    assert "ev-00000" in str(outputs[0])
-    assert sum(len(str(output)) for output in outputs) <= 72_000
+    assert len(filtered.input) == 2
+    assert not any(isinstance(item, dict) and item.get("type") == "function_call" for item in filtered.input)
+    checkpoint = str(filtered.input[-1])
+    assert "WORKING_MEMORY_CHECKPOINT" in checkpoint
+    assert "ev-00009" in checkpoint
+    assert len(json.dumps(filtered.input, ensure_ascii=False).encode("utf-8")) <= 72_000
 
 
 def test_history_compaction_keeps_latest_content_and_useful_old_preview() -> None:
@@ -203,15 +214,11 @@ def test_history_compaction_keeps_latest_content_and_useful_old_preview() -> Non
     filtered = BoundedToolOutputFilter(old_output_chars=120)(
         CallModelData(model_data=model_data, agent=SimpleNamespace(), context=None)  # type: ignore[arg-type]
     )
-    outputs = [
-        str(item["output"])
-        for item in filtered.input
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
-    ]
-    assert "compacted_tool_output" in outputs[0]
-    assert "row-0" in outputs[0]
-    assert "ev-00000" in outputs[0]
-    assert "compacted_tool_output" not in outputs[-1]
+    checkpoint = str(filtered.input[-1])
+    assert "compacted_tool_output" in checkpoint
+    assert "row-0" in checkpoint
+    assert "ev-00000" in checkpoint
+    assert not any(isinstance(item, dict) and item.get("type") == "function_call" for item in filtered.input)
 
 
 def test_large_dom_projection_is_bounded_relevant_and_bid_preserving() -> None:
@@ -328,12 +335,7 @@ def test_repeated_observation_filter_keeps_last_changed_bid_catalog() -> None:
             context=None,
         )
     )
-    outputs = "\n".join(
-        str(item["output"])
-        for item in filtered.input
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
-    )
-    assert "b119" in outputs
+    assert "b119" in str(filtered.input[-1])
 
 
 @pytest.mark.asyncio
@@ -510,7 +512,7 @@ async def test_tpm_wait_expires_reservation_without_api_retry() -> None:
     reservation = await limiter.acquire(30)
     assert reservation["reason"] == "pre_send_tpm_capacity"
     assert reservation["wait_seconds"] >= 2.0
-    assert events == [(now[0], 30)]
+    assert [(event[0], event[1]) for event in events] == [(now[0], 30)]
 
 
 @pytest.mark.asyncio
@@ -602,7 +604,7 @@ def test_tpm_reservation_timestamp_is_taken_after_lock_wait() -> None:
         clock=lambda: now[0],
     )
     assert limiter.try_acquire(60)[0] is True
-    assert events == [(5.0, 60)]
+    assert [(event[0], event[1]) for event in events] == [(5.0, 60)]
     now[0] = 60.0
     assert limiter.try_acquire(60)[0] is False
     now[0] = 65.01
@@ -759,21 +761,22 @@ async def test_coverage_certificate_must_be_runtime_signed_and_untampered() -> N
         ToolContext(context, tool_name="record_coverage", tool_call_id="1", tool_arguments=json.dumps(coverage_args)),
         json.dumps(coverage_args),
     )
-    certificate = json.loads(coverage_output)["certificate"]
-    assert certificate["unique_item_count"] == 2
-    assert certificate["duplicate_item_count"] == 1
+    coverage_result = json.loads(coverage_output)
+    coverage_id = coverage_result["coverage_id"]
+    assert coverage_result["unique_item_count"] == 2
+    assert coverage_result["duplicate_item_count"] == 1
 
     finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
     finish_args = {
         "answer": "A, B",
         "evidence_ids": [rows.evidence_id],
         "evidence_bindings": [{"path": "$", "evidence_ids": [rows.evidence_id]}],
-        "coverage": certificate,
+        "coverage_id": coverage_id,
     }
-    tampered = {**finish_args, "coverage": {**certificate, "unique_item_count": 999}}
+    unknown = {**finish_args, "coverage_id": "cov-forged"}
     tampered_output = await finish_tool.on_invoke_tool(
-        ToolContext(context, tool_name="finish", tool_call_id="2", tool_arguments=json.dumps(tampered)),
-        json.dumps(tampered),
+        ToolContext(context, tool_name="finish", tool_call_id="2", tool_arguments=json.dumps(unknown)),
+        json.dumps(unknown),
     )
     assert json.loads(tampered_output)["accepted"] is False
     accepted_output = await finish_tool.on_invoke_tool(
@@ -783,7 +786,7 @@ async def test_coverage_certificate_must_be_runtime_signed_and_untampered() -> N
     assert json.loads(accepted_output)["accepted"] is True
     assert context.finish_accepted is True
     assert len(context.final_evidence_ids) == 2
-    assert context.coverage_evidence_ids[certificate["item_fingerprint"]] in context.final_evidence_ids
+    assert context.coverage_evidence_ids[coverage_id] in context.final_evidence_ids
 
 
 @pytest.mark.asyncio
@@ -815,3 +818,1006 @@ def test_default_main_does_not_import_uitars() -> None:
     source = open("src/agent/main.py", encoding="utf-8").read()
     assert "UITARSAgent" not in source
     assert "from agent import" not in source
+
+
+def test_state_action_cycles_period_one_to_four_are_stopped() -> None:
+    for period in range(1, 5):
+        context = make_context()
+        context.no_progress_limit = 100
+        for index in [*range(period), *range(period)]:
+            arguments = {"slot": index}
+            context.record_call("dialog", arguments)
+            context.record_tool_outcome("dialog", arguments, {"ok": False, "error": "offline"})
+        assert context.loop_detected is True
+        assert f"周期 {period}" in str(context.loop_reason)
+
+
+@pytest.mark.asyncio
+async def test_identical_rejected_finish_stops_before_third_request() -> None:
+    context = make_context()
+    finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
+    arguments = json.dumps({"answer": "7", "evidence_ids": []})
+    for index in range(2):
+        output = await finish_tool.on_invoke_tool(
+            ToolContext(context, tool_name="finish", tool_call_id=str(index), tool_arguments=arguments),
+            arguments,
+        )
+        assert json.loads(output)["accepted"] is False
+    assert context.tool_steps == 2
+    assert context.loop_detected is True
+    with pytest.raises(NoProgressLoopError, match="REPEATED_FINISH"):
+        await ProtocolRunHooks().on_llm_start(
+            RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_cache_avoids_duplicate_collection_and_cache_exceptions() -> None:
+    class CountingActor(DummyActor):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.fail_once = True
+
+        async def extract(self, kind: str, bid: str | None, limit: int) -> dict[str, object]:
+            self.calls += 1
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("offline capture failure")
+            return {
+                "data": ["A", "B"],
+                "evidence_id": "ev-cached",
+                "url": "https://example.test",
+                "content_hash": "content-1",
+                "semantic_page_fingerprint": "page-1",
+            }
+
+    context = make_context()
+    actor = CountingActor()
+    context.actor = actor  # type: ignore[assignment]
+    context.current_semantic_fingerprint = "page-1"
+    tool = next(item for item in TOOLS if item.name == "extract")
+    arguments = json.dumps({"kind": "list", "bid": None, "limit": 100})
+    failed = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract", tool_call_id="1", tool_arguments=arguments), arguments
+    )
+    assert json.loads(failed)["ok"] is False
+    first = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract", tool_call_id="2", tool_arguments=arguments), arguments
+    )
+    second = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract", tool_call_id="3", tool_arguments=arguments), arguments
+    )
+    assert json.loads(first)["cache_hit"] is False
+    assert json.loads(second)["cache_hit"] is True
+    assert actor.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_cache_does_not_store_new_state_under_old_state_key() -> None:
+    class DriftingActor(DummyActor):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def extract(self, kind: str, bid: str | None, limit: int) -> dict[str, object]:
+            self.calls += 1
+            return {
+                "data": [f"state-b-call-{self.calls}"],
+                "evidence_id": f"ev-{self.calls}",
+                "content_hash": f"hash-{self.calls}",
+                "semantic_page_fingerprint": "state-b",
+            }
+
+    context = make_context()
+    actor = DriftingActor()
+    context.actor = actor  # type: ignore[assignment]
+    context.current_semantic_fingerprint = "state-a"
+    tool = next(item for item in TOOLS if item.name == "extract")
+    arguments = json.dumps({"kind": "list", "bid": None, "limit": 100})
+    await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract", tool_call_id="1", tool_arguments=arguments), arguments
+    )
+    context.current_semantic_fingerprint = "state-a"
+    await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract", tool_call_id="2", tool_arguments=arguments), arguments
+    )
+    assert actor.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_many_is_sequential_bounded_and_deduplicates_requests() -> None:
+    class ManyActor(DummyActor):
+        def __init__(self) -> None:
+            self.batches: list[list[dict[str, object]]] = []
+
+        async def extract_many(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
+            self.batches.append(requests)
+            return [
+                {
+                    "data": [request["kind"]],
+                    "evidence_id": f"ev-{index}",
+                    "content_hash": f"hash-{index}",
+                    "semantic_page_fingerprint": "page-1",
+                }
+                for index, request in enumerate(requests)
+            ]
+
+    context = make_context()
+    actor = ManyActor()
+    context.actor = actor  # type: ignore[assignment]
+    context.current_semantic_fingerprint = "page-1"
+    tool = next(item for item in TOOLS if item.name == "extract_many")
+    arguments = json.dumps(
+        {
+            "requests": [
+                {"kind": "text", "bid": None, "limit": 100},
+                {"kind": "text", "bid": None, "limit": 100},
+                {"kind": "list", "bid": None, "limit": 100},
+            ]
+        }
+    )
+    output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract_many", tool_call_id="many", tool_arguments=arguments), arguments
+    )
+    payload = json.loads(output)
+    assert len(payload["results"]) == 3
+    assert payload["cache_hit_count"] == 1
+    assert len(actor.batches) == 1 and len(actor.batches[0]) == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_many_rejects_mixed_semantic_states_without_publishing_cache() -> None:
+    class DriftingManyActor(DummyActor):
+        async def extract_many(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
+            assert [request["kind"] for request in requests] == ["list"]
+            return [
+                {
+                    "data": ["B"],
+                    "evidence_id": "ev-b",
+                    "content_hash": "hash-b",
+                    "semantic_page_fingerprint": "state-b",
+                }
+            ]
+
+    context = make_context()
+    context.actor = DriftingManyActor()  # type: ignore[assignment]
+    context.current_semantic_fingerprint = "state-a"
+    text_request = {"kind": "text", "bid": None, "limit": 100}
+    cached_key = TaskRuntimeContext._signature("extract", {"state": "state-a", **text_request})
+    context.extract_cache[cached_key] = {
+        "ok": True,
+        **text_request,
+        "data": ["A"],
+        "evidence_id": "ev-a",
+        "content_hash": "hash-a",
+        "semantic_page_fingerprint": "state-a",
+    }
+    tool = next(item for item in TOOLS if item.name == "extract_many")
+    arguments = json.dumps(
+        {"requests": [text_request, {"kind": "list", "bid": None, "limit": 100}]}
+    )
+    output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract_many", tool_call_id="mixed", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+    assert payload["ok"] is False
+    assert payload["semantic_page_fingerprints"] == ["state-a", "state-b"]
+    assert list(context.extract_cache) == [cached_key]
+
+
+@pytest.mark.asyncio
+async def test_repeated_recall_chunk_is_no_progress_and_stops() -> None:
+    context = make_context()
+    evidence = context.evidence_store.add("dom", "https://example.test", "rows", {"data": ["A"]})
+    tool = next(item for item in TOOLS if item.name == "recall_evidence")
+    arguments = json.dumps({"evidence_id": evidence.evidence_id, "offset": 0, "limit": 100})
+    outputs = []
+    for index in range(3):
+        outputs.append(
+            json.loads(
+                await tool.on_invoke_tool(
+                    ToolContext(context, tool_name="recall_evidence", tool_call_id=str(index), tool_arguments=arguments),
+                    arguments,
+                )
+            )
+        )
+    assert outputs[0]["progressed"] is True
+    assert outputs[-1]["progressed"] is False
+    assert context.loop_detected is True
+
+
+@pytest.mark.asyncio
+async def test_sec_style_same_tabs_new_url_loop_stops_under_twenty_steps() -> None:
+    class ReusingActor(DummyActor):
+        async def tabs(self, action: str, index: int | None, url: str | None) -> dict[str, object]:
+            return {
+                "tabs": [{"index": 0, "url": "https://example.test/report", "active": True}],
+                "reused": True,
+                "semantic_page_fingerprint": "blocked",
+            }
+
+    context = make_context()
+    context.actor = ReusingActor()  # type: ignore[assignment]
+    context.current_url = "https://example.test/report"
+    context.current_semantic_fingerprint = "blocked"
+    context.seen_urls.add("https://example.test/report")
+    context.seen_page_states.add(("https://example.test/report", "blocked"))
+    tool = next(item for item in TOOLS if item.name == "tabs")
+    arguments = json.dumps(
+        {"action": "new", "index": None, "url": "https://example.test/report"}
+    )
+    while not context.loop_detected:
+        await tool.on_invoke_tool(
+            ToolContext(context, tool_name="tabs", tool_call_id=str(context.tool_steps), tool_arguments=arguments),
+            arguments,
+        )
+    assert context.tool_steps < 20
+
+
+def test_real_spa_pagination_scroll_and_virtual_list_progress_are_not_killed() -> None:
+    context = make_context()
+    for index in range(12):
+        arguments = {"bid": "next" if index < 4 else "virtual", "index": index}
+        context.record_call("click" if index < 4 else "scroll", arguments)
+        result = {
+            "ok": True,
+            "url": "https://example.test/collection",
+            "semantic_page_fingerprint": f"semantic-{index}",
+            "postconditions": {"before": index * 100, "after": (index + 1) * 100},
+        }
+        context.record_tool_outcome("click" if index < 4 else "scroll", arguments, result)
+    assert context.loop_detected is False
+    assert context.no_progress_streak == 0
+    assert context.progress_credit == 12
+
+
+def test_adaptive_budget_is_base_thirty_plus_progress_with_absolute_sixty() -> None:
+    stalled = make_context()
+    stalled.no_progress_limit = 100
+    for index in range(30):
+        arguments = {"index": index}
+        stalled.record_call("dialog", arguments)
+        stalled.record_tool_outcome("dialog", arguments, {"ok": False})
+    stalled.assert_model_budget()
+    assert stalled.loop_detected is True
+    assert stalled.adaptive_step_budget == 30
+
+    progressing = make_context()
+    progressing.no_progress_limit = 100
+    for index in range(30):
+        arguments = {"index": index}
+        progressing.record_call("observe", arguments)
+        progressing.record_tool_outcome(
+            "observe",
+            arguments,
+            {
+                "url": "https://example.test",
+                "semantic_page_fingerprint": f"state-{index}",
+            },
+        )
+    assert progressing.adaptive_step_budget == 60
+    for index in range(30, 60):
+        progressing.record_call("dialog", {"index": index})
+    with pytest.raises(RuntimeError, match="STEP_LIMIT"):
+        progressing.record_call("dialog", {"index": 60})
+
+
+def test_context_checkpoint_removes_call_arguments_and_has_hard_bound() -> None:
+    context = make_context()
+    context.current_url = "https://example.test/current"
+    context.current_semantic_fingerprint = "semantic-current"
+    context.latest_elements = {
+        f"b{index}": {"bid": f"b{index}", "tag": "button", "text": "x" * 500}
+        for index in range(200)
+    }
+    for index in range(100):
+        context.evidence_store.add(
+            "dom", "https://example.test", f"evidence {index}", {"data": "x" * 2_000}
+        )
+    items: list[dict[str, object]] = [{"role": "user", "content": "original task"}]
+    for index in range(20):
+        items.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": str(index),
+                    "name": "finish",
+                    "arguments": json.dumps({"answer": "x" * 20_000}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": str(index),
+                    "output": json.dumps({"accepted": False, "reasons": ["invalid"]}),
+                },
+            ]
+        )
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=items, instructions="instructions"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    serialized = json.dumps(filtered.input, ensure_ascii=False).encode("utf-8")
+    assert len(serialized) <= 60_000
+    assert b"function_call" not in serialized
+    assert b"semantic-current" in serialized
+
+
+def test_checkpoint_keeps_projected_bid_catalog_and_bounds_rich_selects() -> None:
+    context = make_context()
+    context.current_semantic_fingerprint = "semantic-current"
+    projected = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "report",
+            "dom_hash": "raw",
+            "elements": [
+                *[
+                    {"bid": f"noise-{index}", "tag": "div", "text": "noise", "visible": True}
+                    for index in range(130)
+                ],
+                {"bid": "next-page", "tag": "button", "text": "Next report page", "visible": True},
+            ],
+        },
+        "Next report page",
+        unchanged=False,
+    )
+    context.latest_model_elements = list(projected["elements"])
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    assert "next-page" in json.dumps(filtered.input, ensure_ascii=False)
+
+    context.latest_model_elements = [
+        {
+            "bid": f"select-{index}",
+            "tag": "select",
+            "label": "x" * 300,
+            "options": [
+                {"value": "v" * 160, "label": "l" * 160, "selected": False}
+                for _ in range(40)
+            ],
+        }
+        for index in range(20)
+    ]
+    bounded = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    assert len(json.dumps(bounded.input, ensure_ascii=False).encode("utf-8")) <= 60_000
+
+
+@pytest.mark.asyncio
+async def test_schema_failures_are_counted_and_repeated_finish_stops() -> None:
+    context = make_context()
+    finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
+    invalid = json.dumps({"answer": "7"})
+    for index in range(2):
+        output = await finish_tool.on_invoke_tool(
+            ToolContext(context, tool_name="finish", tool_call_id=str(index), tool_arguments=invalid),
+            invalid,
+        )
+        assert json.loads(output)["ok"] is False
+    assert context.tool_steps == 2
+    assert len(context.tool_outcomes) == 2
+    assert "REPEATED_FINISH" in str(context.loop_reason)
+
+
+def test_timeout_failure_completes_pending_outcome_without_double_counting() -> None:
+    context = make_context()
+    arguments = {"answer": "7", "evidence_ids": []}
+    context.record_call("finish", arguments)
+    tool_context = ToolContext(
+        context,
+        tool_name="finish",
+        tool_call_id="timeout",
+        tool_arguments=json.dumps(arguments),
+    )
+    payload = json.loads(_tool_failure(tool_context, TimeoutError("offline timeout")))
+    assert payload["ok"] is False
+    assert context.tool_steps == 1
+    assert len(context.tool_outcomes) == 1
+
+
+def test_password_fill_timeout_reuses_redacted_pending_arguments() -> None:
+    context = make_context()
+    context.record_call("fill", {"bid": "password", "value": "[REDACTED]"})
+    tool_context = ToolContext(
+        context,
+        tool_name="fill",
+        tool_call_id="timeout",
+        tool_arguments=json.dumps({"bid": "password", "value": "plain-text-secret"}),
+    )
+    payload = json.loads(_tool_failure(tool_context, TimeoutError("offline timeout")))
+    serialized = json.dumps(
+        {"payload": payload, "actions": context.actions, "outcomes": context.tool_outcomes},
+        ensure_ascii=False,
+    )
+    assert context.tool_steps == 1
+    assert len(context.tool_outcomes) == 1
+    assert "plain-text-secret" not in serialized
+
+
+def test_changed_action_updates_checkpoint_and_clears_stale_bids() -> None:
+    context = make_context()
+    context.current_url = "https://example.test/old"
+    context.current_semantic_fingerprint = "old-state"
+    context.latest_model_elements = [{"bid": "stale", "tag": "button", "text": "Old"}]
+    arguments = {"bid": "next"}
+    context.record_call("click", arguments)
+    context.record_tool_outcome(
+        "click",
+        arguments,
+        {
+            "success": True,
+            "before_url": "https://example.test/old",
+            "after_url": "https://example.test/new",
+            "postconditions": {
+                "after_semantic_page_fingerprint": "new-state",
+                "post_observation": {
+                    "url": "https://example.test/new",
+                    "title": "New",
+                    "semantic_page_fingerprint": "new-state",
+                    "semantic_element_count": 2,
+                },
+            },
+        },
+    )
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    checkpoint = json.dumps(filtered.input, ensure_ascii=False)
+    assert context.latest_model_elements == []
+    assert context.current_url == "https://example.test/new"
+    assert "new-state" in checkpoint and "post_observation" in checkpoint
+    assert '"stale"' not in checkpoint
+
+
+@pytest.mark.asyncio
+async def test_scalar_finish_safely_defaults_root_evidence_binding() -> None:
+    context = make_context()
+    evidence = context.evidence_store.add("dom", "https://example.test", "answer", {"data": "7"})
+    context.visited_urls.append("https://example.test")
+    tool = next(item for item in TOOLS if item.name == "finish")
+    arguments = json.dumps({"answer": "7", "evidence_ids": [evidence.evidence_id]})
+    output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="finish", tool_arguments=arguments), arguments
+    )
+    assert json.loads(output)["accepted"] is True
+    assert context.final_bindings == {"$": [evidence.evidence_id]}
+
+
+@pytest.mark.asyncio
+async def test_structured_answer_requires_leaf_bindings_and_checks_numeric_units() -> None:
+    context = make_context()
+    evidence = context.evidence_store.add(
+        "dom", "https://example.test", "answers", {"data": ["A", "B", "7 ft"]}
+    )
+    context.visited_urls.append("https://example.test")
+    tool = next(item for item in TOOLS if item.name == "finish")
+    structured = json.dumps({"items": ["A", "B"]})
+    arguments = json.dumps({"answer": structured, "evidence_ids": [evidence.evidence_id]})
+    output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="structured", tool_arguments=arguments), arguments
+    )
+    payload = json.loads(output)
+    assert payload["accepted"] is False
+    assert any("$.items[0]" in reason for reason in payload["reasons"])
+    assert "$" not in context.final_bindings
+
+    mismatch = json.dumps({"answer": "999 miles", "evidence_ids": [evidence.evidence_id]})
+    mismatch_output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="mismatch", tool_arguments=mismatch), mismatch
+    )
+    mismatch_payload = json.loads(mismatch_output)
+    assert mismatch_payload["accepted"] is False
+    assert any("数值" in reason or "单位" in reason for reason in mismatch_payload["reasons"])
+
+
+@pytest.mark.asyncio
+async def test_latest_coverage_handle_is_used_and_coverage_publish_is_atomic(monkeypatch) -> None:
+    context = make_context()
+    context.contract = TaskContract.from_item(
+        {"task_idx": 1, "task_id": "x", "website": "https://example.test", "task": "列出所有记录"}
+    )
+    first_rows = context.evidence_store.add("dom", "https://example.test", "first", {"data": ["A", "B"]})
+    latest_rows = context.evidence_store.add("dom", "https://example.test", "latest", {"data": ["A", "B", "C"]})
+    terminal = context.evidence_store.add("dom", "https://example.test", "terminal", {"disabled": True})
+    context.visited_urls.append("https://example.test")
+    coverage_tool = next(tool for tool in TOOLS if tool.name == "record_coverage")
+
+    async def issue(evidence_id: str, total: int, call_id: str) -> str:
+        arguments = json.dumps(
+            {
+                "strategy": "pagination",
+                "item_evidence_ids": [evidence_id],
+                "pages_visited": total,
+                "expected_total": total,
+                "terminal_reason": "next_disabled",
+                "terminal_evidence_id": terminal.evidence_id,
+            }
+        )
+        return await coverage_tool.on_invoke_tool(
+            ToolContext(context, tool_name="record_coverage", tool_call_id=call_id, tool_arguments=arguments),
+            arguments,
+        )
+
+    await issue(first_rows.evidence_id, 2, "cov-1")
+    latest = json.loads(await issue(latest_rows.evidence_id, 3, "cov-2"))["coverage_id"]
+    assert context.latest_coverage_id == latest
+
+    finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
+    bindings = [
+        {"path": f"$[{index}]", "evidence_ids": [latest_rows.evidence_id]}
+        for index in range(3)
+    ]
+    finish_args = json.dumps(
+        {"answer": json.dumps(["A", "B", "C"]), "evidence_ids": [latest_rows.evidence_id], "evidence_bindings": bindings}
+    )
+    output = await finish_tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="finish-latest", tool_arguments=finish_args),
+        finish_args,
+    )
+    assert json.loads(output)["accepted"] is True
+    assert context.final_coverage and context.final_coverage.unique_item_count == 3
+
+    failed_context = make_context()
+    rows = failed_context.evidence_store.add("dom", "https://example.test", "rows", {"data": ["A"]})
+    end = failed_context.evidence_store.add("dom", "https://example.test", "end", {"disabled": True})
+    original_add = failed_context.evidence_store.add
+
+    def fail_receipt(source, url, summary, payload):  # noqa: ANN001, ANN202
+        if source == "receipt":
+            raise OSError("offline disk failure")
+        return original_add(source, url, summary, payload)
+
+    monkeypatch.setattr(failed_context.evidence_store, "add", fail_receipt)
+    failed_arguments = json.dumps(
+        {
+            "strategy": "pagination",
+            "item_evidence_ids": [rows.evidence_id],
+            "pages_visited": 1,
+            "expected_total": 1,
+            "terminal_reason": "next_disabled",
+            "terminal_evidence_id": end.evidence_id,
+        }
+    )
+    failed = await coverage_tool.on_invoke_tool(
+        ToolContext(failed_context, tool_name="record_coverage", tool_call_id="failed", tool_arguments=failed_arguments),
+        failed_arguments,
+    )
+    assert json.loads(failed)["ok"] is False
+    assert failed_context.coverage_records == {}
+    assert len(failed_context.tool_outcomes) == 1
+
+
+def test_tabs_outcome_uses_active_url_for_semantic_state() -> None:
+    context = make_context()
+    arguments = {"action": "list", "index": None, "url": None}
+    context.record_call("tabs", arguments)
+    context.record_tool_outcome(
+        "tabs",
+        arguments,
+        {
+            "ok": True,
+            "tabs": [
+                {"url": "https://example.test/active", "active": True},
+                {"url": "https://example.test/background", "active": False},
+            ],
+            "semantic_page_fingerprint": "active-state",
+        },
+    )
+    assert context.current_url == "https://example.test/active"
+    assert context.last_observation_state == ("https://example.test/active", "active-state")
+
+
+def test_plain_english_and_chinese_list_shapes_enforce_complete_counts() -> None:
+    certificate = CoverageCertificate(
+        strategy="pagination",
+        unique_item_count=3,
+        pages_visited=2,
+        expected_total=3,
+        terminal_reason="next_disabled",
+        terminal_evidence_id="ev-terminal",
+        item_fingerprint="a" * 64,
+    )
+    top = TaskContract.from_item(
+        {"task_idx": 1, "task_id": "top", "website": "https://example.test", "task": "Top 3 companies"}
+    )
+    english_all = TaskContract.from_item(
+        {"task_idx": 2, "task_id": "all", "website": "https://example.test", "task": "List all companies"}
+    )
+    assert _answer_shape_reasons(top, "A, B", certificate)
+    assert _answer_shape_reasons(english_all, "A\nB", certificate)
+    assert _answer_shape_reasons(top, "A、B、C", certificate) == []
+
+    chinese_top = TaskContract.from_item(
+        {
+            "task_idx": 3,
+            "task_id": "chinese-top",
+            "website": "https://example.test",
+            "task": "最高的前三个季度是哪三个",
+        }
+    )
+    assert _answer_shape_reasons(chinese_top, "第一季度", certificate)
+    assert _answer_shape_reasons(chinese_top, "第一季度、第二季度、第三季度", certificate) == []
+
+    wid = TaskContract.from_item(
+        {
+            "task_idx": 4,
+            "task_id": "wid",
+            "website": "https://example.test",
+            "task": "在WID中选择Country=Mongolia、Indicator=Top 10% income share、Year=2010,图表上hover显示的值是多少(%)?",
+        }
+    )
+    assert wid.requires_coverage is False
+    assert _answer_shape_reasons(wid, "32%", None) == []
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_unit_mismatch_and_requires_explicit_task_unit() -> None:
+    finish_tool = next(item for item in TOOLS if item.name == "finish")
+
+    mismatch_context = make_context()
+    mismatch_evidence = mismatch_context.evidence_store.add(
+        "dom", "https://example.test", "height", {"data": "100 ft"}
+    )
+    mismatch_context.visited_urls.append("https://example.test")
+    mismatch_arguments = json.dumps(
+        {"answer": "100 m", "evidence_ids": [mismatch_evidence.evidence_id]}
+    )
+    mismatch_output = await finish_tool.on_invoke_tool(
+        ToolContext(
+            mismatch_context,
+            tool_name="finish",
+            tool_call_id="unit-mismatch",
+            tool_arguments=mismatch_arguments,
+        ),
+        mismatch_arguments,
+    )
+    assert any("单位" in reason for reason in json.loads(mismatch_output)["reasons"])
+
+    percent_context = make_context()
+    percent_context.contract = TaskContract.from_item(
+        {
+            "task_idx": 2,
+            "task_id": "percent",
+            "website": "https://example.test",
+            "task": "What is the reported value (%)?",
+        }
+    )
+    percent_evidence = percent_context.evidence_store.add(
+        "dom", "https://example.test", "percent", {"data": "52%"}
+    )
+    percent_context.visited_urls.append("https://example.test")
+    missing_unit_arguments = json.dumps(
+        {"answer": "52", "evidence_ids": [percent_evidence.evidence_id]}
+    )
+    missing_unit_output = await finish_tool.on_invoke_tool(
+        ToolContext(
+            percent_context,
+            tool_name="finish",
+            tool_call_id="percent-missing",
+            tool_arguments=missing_unit_arguments,
+        ),
+        missing_unit_arguments,
+    )
+    assert any("缺少题目明确要求的单位" in reason for reason in json.loads(missing_unit_output)["reasons"])
+
+    accepted_context = make_context()
+    accepted_context.contract = percent_context.contract
+    accepted_evidence = accepted_context.evidence_store.add(
+        "dom", "https://example.test", "percent", {"data": "52%"}
+    )
+    accepted_context.visited_urls.append("https://example.test")
+    accepted_arguments = json.dumps(
+        {"answer": "52%", "evidence_ids": [accepted_evidence.evidence_id]}
+    )
+    accepted_output = await finish_tool.on_invoke_tool(
+        ToolContext(
+            accepted_context,
+            tool_name="finish",
+            tool_call_id="percent-accepted",
+            tool_arguments=accepted_arguments,
+        ),
+        accepted_arguments,
+    )
+    assert json.loads(accepted_output)["accepted"] is True
+
+
+def test_tpm_cold_start_calibration_and_reconcile_low_estimate() -> None:
+    metrics = model_input_metrics("system", [{"role": "user", "content": "x" * 10_000}], [])
+    serialized = metrics["serialized_context_bytes"]
+    cold = estimate_input_tokens("system", [{"role": "user", "content": "x" * 10_000}], [])
+    samples = [(float(index), "agent", 0.25) for index in range(20)]
+    events: list[tuple[float, int, str]] = []
+    limiter = SharedTPMLimiter(
+        events,
+        threading.RLock(),
+        token_budget=10_000,
+        clock=lambda: 30.0,
+        calibration_samples=samples,
+    )
+    calibrated = limiter.estimate_tokens(serialized, "agent")
+    assert calibrated < cold
+    assert calibrated >= int(serialized * 0.28)
+
+    async def reserve_and_reconcile() -> None:
+        reservation = await limiter.acquire(calibrated)
+        limiter.reconcile(reservation, calibrated + 500, serialized, "agent")
+
+    asyncio.run(reserve_and_reconcile())
+    assert events[-1][1] == calibrated + 500
+    assert len(samples) == 21
+
+
+@pytest.mark.asyncio
+async def test_missing_usage_keeps_reservation_and_context_limit_blocks_send() -> None:
+    events: list[tuple[float, int, str]] = []
+    limiter = SharedTPMLimiter(events, threading.RLock(), token_budget=100_000)
+    reservation = await limiter.acquire(1_000)
+    limiter.reconcile(reservation, None, 10_000, "agent")
+    assert events[0][1] == 1_000
+
+    class MustNotRun:
+        async def get_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("model must not run")
+
+    model = ThrottledModel(MustNotRun(), None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="MODEL_INPUT_LIMIT"):
+        await model.get_response(
+            "system",
+            [{"role": "user", "content": "x" * (MAX_SERIALIZED_CONTEXT_BYTES + 1)}],
+            None,
+            [],
+            None,
+            [],
+            None,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_reconcile_lock_failure_keep_fail_closed_reservation() -> None:
+    events: list[tuple[float, int, str]] = []
+    limiter = SharedTPMLimiter(events, threading.RLock(), token_budget=100_000)
+
+    class CancelledModel:
+        async def get_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise asyncio.CancelledError
+
+    model = ThrottledModel(CancelledModel(), limiter)  # type: ignore[arg-type]
+    with pytest.raises(asyncio.CancelledError):
+        await model.get_response(
+            "system",
+            [],
+            None,
+            [],
+            None,
+            [],
+            None,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+    assert len(events) == 1 and events[0][1] > 0
+
+    class UnavailableLock:
+        def acquire(self, timeout: float) -> bool:
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("must not release")
+
+    reservation = {"reservation_id": events[0][2]}
+    limiter.lock = UnavailableLock()
+    with pytest.raises(RuntimeError, match="TPM_LIMITER_LOCK_TIMEOUT"):
+        limiter.reconcile(reservation, 500, 2_000, "agent")
+    assert events[0][1] > 0
+
+
+@pytest.mark.asyncio
+async def test_request_observability_records_bounded_categories_and_latencies() -> None:
+    class SuccessfulModel:
+        async def get_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return SimpleNamespace(
+                usage=Usage(requests=1, input_tokens=123, output_tokens=4, total_tokens=127)
+            )
+
+    stats = TaskUsageStats(3, 8, "sensitive-task-id")
+    stats.set_runtime_snapshot(
+        {
+            "last_tool": "extract",
+            "semantic_state": "semantic-1",
+            "progress_reason": ["new_content_hash"],
+            "repeat_count": 0,
+            "cycle_count": 0,
+            "cache_hit": False,
+            "tool_latency_ms": 2.5,
+            "browser_latency_ms": 2.0,
+        }
+    )
+    model = ThrottledModel(SuccessfulModel(), None)  # type: ignore[arg-type]
+    model.usage_stats = stats
+    await model.get_response(
+        "system",
+        [{"role": "user", "content": "offline"}],
+        None,
+        [],
+        None,
+        [],
+        None,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+    request = stats.requests[0]
+    assert request["worker_id"] == 3 and request["task_idx"] == 8
+    assert request["serialized_context_bytes"] > 0
+    assert request["serialized_context_items"] == 1
+    assert request["category_bytes"]["user_items"] > 0
+    assert request["last_tool"] == "extract"
+    assert request["model_latency_ms"] >= 0
+    assert "sensitive-task-id" not in json.dumps(request)
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_reconciles_before_terminal_event_and_missing_usage_stays_reserved() -> None:
+    usage = Usage(requests=1, input_tokens=5_000, output_tokens=10, total_tokens=5_010)
+
+    class StreamModel:
+        def __init__(self, terminal_usage):  # noqa: ANN001
+            self.terminal_usage = terminal_usage
+            self.calls = 0
+
+        async def stream_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.calls += 1
+            yield SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage=self.terminal_usage),
+            )
+
+    events: list[tuple[float, int, str]] = []
+    samples: list[tuple[float, str, float]] = []
+    limiter = SharedTPMLimiter(
+        events,
+        threading.RLock(),
+        token_budget=100_000,
+        calibration_samples=samples,
+    )
+    wrapped = StreamModel(usage)
+    model = ThrottledModel(wrapped, limiter)  # type: ignore[arg-type]
+    stats = TaskUsageStats(0, 1, "stream-task")
+    model.usage_stats = stats
+    stream = model.stream_response(
+        "system",
+        [{"role": "user", "content": "offline"}],
+        None,
+        [],
+        None,
+        [],
+        None,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+    terminal = await anext(stream)
+    assert terminal.type == "response.completed"
+    await stream.aclose()
+    assert events[0][1] == 5_000
+    assert len(samples) == 1
+    assert len(stats.requests) == 1 and stats.requests[0]["input_tokens"] == 5_000
+
+    missing_events: list[tuple[float, int, str]] = []
+    missing_wrapped = StreamModel(None)
+    missing_model = ThrottledModel(
+        missing_wrapped,
+        SharedTPMLimiter(missing_events, threading.RLock(), token_budget=100_000),
+    )  # type: ignore[arg-type]
+    missing_stats = TaskUsageStats(0, 2, "missing-stream-usage")
+    missing_model.usage_stats = missing_stats
+    missing_stream = missing_model.stream_response(
+        "system",
+        [],
+        None,
+        [],
+        None,
+        [],
+        None,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+    await anext(missing_stream)
+    await missing_stream.aclose()
+    assert missing_events[0][1] == missing_stats.requests[0]["estimated_input_tokens"]
+    assert missing_stats.requests[0]["usage_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_context_limit_is_observed_without_calling_wrapped_model() -> None:
+    class MustNotStream:
+        calls = 0
+
+        async def stream_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.calls += 1
+            yield SimpleNamespace(type="unexpected")
+
+    wrapped = MustNotStream()
+    model = ThrottledModel(wrapped, None)  # type: ignore[arg-type]
+    stats = TaskUsageStats(0, 1, "oversized-stream")
+    model.usage_stats = stats
+    with pytest.raises(ValueError, match="MODEL_INPUT_LIMIT"):
+        async for _ in model.stream_response(
+            "system",
+            [{"role": "user", "content": "x" * (MAX_SERIALIZED_CONTEXT_BYTES + 1)}],
+            None,
+            [],
+            None,
+            [],
+            None,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            pass
+    assert wrapped.calls == 0
+    assert stats.requests[0]["throttle_reason"] == "pre_send_context_limit"
+
+
+def test_tpm_reservations_are_unique_across_threads_and_expired_reconcile_is_safe() -> None:
+    events: list[tuple[float, int, str]] = []
+    limiter = SharedTPMLimiter(events, threading.RLock(), token_budget=100)
+    barrier = threading.Barrier(2)
+    reservations: list[dict[str, object]] = []
+
+    def reserve() -> None:
+        barrier.wait()
+        reservations.append(asyncio.run(limiter.acquire(10)))
+
+    threads = [threading.Thread(target=reserve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    reservation_ids = {str(item["reservation_id"]) for item in reservations}
+    assert len(reservation_ids) == 2
+    assert reservation_ids == {str(event[2]) for event in events}
+
+    now = [0.0]
+    expiring_events: list[tuple[float, int, str]] = []
+    samples: list[tuple[float, str, float]] = []
+    expiring = SharedTPMLimiter(
+        expiring_events,
+        threading.RLock(),
+        token_budget=100,
+        clock=lambda: now[0],
+        calibration_samples=samples,
+    )
+
+    async def expire_and_reconcile() -> tuple[dict[str, object], dict[str, object]]:
+        old = await expiring.acquire(10)
+        now[0] = 61.0
+        new = await expiring.acquire(20)
+        expiring.reconcile(old, 30, 100, "agent")
+        return old, new
+
+    old, new = asyncio.run(expire_and_reconcile())
+    assert [event[2] for event in expiring_events] == [new["reservation_id"]]
+    assert samples[-1][2] == 0.3
+    with pytest.raises(RuntimeError, match="MISSING_RESERVATION"):
+        expiring.reconcile({"reservation_id": "unknown", "reserved_at": now[0]}, 10, 100, "agent")

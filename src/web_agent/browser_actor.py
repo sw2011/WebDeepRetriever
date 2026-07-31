@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from pypdf import PdfReader
 
@@ -44,6 +44,9 @@ _CONFIRMATION = re.compile(
 _SUBMIT_TARGET = re.compile(
     r"(?:submit|send|save|create|confirm|apply|register|login|sign in|checkout|place order|提交|发送|保存|创建|确认|申请|注册|登录|下单)",
     re.I,
+)
+_VOLATILE_TEXT = re.compile(
+    r"(?:\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b|\b1\d{12}\b)"
 )
 _MARK_AND_COLLECT = r"""
 ({frameIndex, maxElements}) => {
@@ -144,6 +147,85 @@ def _error_type(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def canonical_url(value: str) -> str:
+    """Normalize a URL for state identity while retaining meaningful query parameters."""
+
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").casefold()
+    port = parsed.port
+    if port and not ((parsed.scheme.casefold() == "http" and port == 80) or (parsed.scheme.casefold() == "https" and port == 443)):
+        host = f"{host}:{port}"
+    path = parsed.path or "/"
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)), doseq=True)
+    return urlunsplit((parsed.scheme.casefold(), host, path, query, parsed.fragment))
+
+
+def semantic_page_fingerprint(
+    url: str,
+    title: str,
+    elements: list[dict[str, Any]],
+    *,
+    scroll_state: list[Any] | None = None,
+) -> str:
+    """Hash bounded semantic state, excluding raw markup, bids, layout and volatile clocks."""
+
+    projected_by_frame: dict[str, list[dict[str, Any]]] = {}
+    for element in elements:
+        if not isinstance(element, dict) or element.get("frame_error"):
+            continue
+        item: dict[str, Any] = {}
+        for key in (
+            "frame_url",
+            "tag",
+            "role",
+            "label",
+            "text",
+            "value",
+            "checked",
+            "selected",
+            "disabled",
+            "href",
+            "type",
+            "name",
+            "options",
+        ):
+            value = element.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if isinstance(value, str):
+                value = _VOLATILE_TEXT.sub("<volatile-time>", re.sub(r"\s+", " ", value).strip())
+                if key in {"href", "frame_url"}:
+                    value = canonical_url(value)
+            item[key] = value
+        if item:
+            frame_key = str(element.get("frame", item.get("frame_url", "main")))
+            projected_by_frame.setdefault(frame_key, []).append(item)
+    frame_summaries = []
+    for frame_key, projected in projected_by_frame.items():
+        encoded_frame = json.dumps(
+            projected,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        frame_summaries.append(
+            {
+                "frame": frame_key,
+                "count": len(projected),
+                "digest": hashlib.sha256(encoded_frame.encode("utf-8", errors="replace")).hexdigest(),
+            }
+        )
+    payload = {
+        "url": canonical_url(url),
+        "title": _VOLATILE_TEXT.sub("<volatile-time>", title.strip()),
+        "frames": frame_summaries,
+        "scroll": scroll_state or [],
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()[:20]
+
+
 def _opaque_body(raw: bytes, limit: int) -> dict[str, Any]:
     return {
         "binary_or_unstructured": True,
@@ -201,6 +283,8 @@ class BrowserActor:
         self._bid_counter = 1
         self._step_counter = 0
         self._action_counter = 0
+        self._observation_counter = 0
+        self._visual_counter = 0
         self._network_cursor = 0
         self._network_records: list[dict[str, Any]] = []
         self._dialogs: list[dict[str, Any]] = []
@@ -209,6 +293,11 @@ class BrowserActor:
         self._new_pages: list[str] = []
         self._attached_pages: set[int] = set()
         self._pdf_responses: list[Any] = []
+        self._last_dom_hash: str | None = None
+        self._last_semantic_state: dict[str, Any] | None = None
+        self._last_capture_semantic: str | None = None
+        self._last_capture_path: str | None = None
+        self._last_observation_semantic: str | None = None
 
     async def _call(self, function: Callable[..., T], *args: Any) -> T:
         if self._closed and function is not self._close_sync:
@@ -264,12 +353,19 @@ class BrowserActor:
         self._bid_counter = 1
         self._step_counter = 0
         self._action_counter = 0
+        self._observation_counter = 0
+        self._visual_counter = 0
         self._network_cursor = 0
         self._network_records = []
         self._dialogs = []
         self._downloads = []
         self._new_pages = []
         self._pdf_responses = []
+        self._last_dom_hash = None
+        self._last_semantic_state = None
+        self._last_capture_semantic = None
+        self._last_capture_path = None
+        self._last_observation_semantic = None
         if self._playwright is None:
             return self._start_sync(initial_url)
         return self._prepare_task(initial_url)
@@ -288,7 +384,7 @@ class BrowserActor:
         self._page.goto(initial_url, wait_until="domcontentloaded", timeout=60_000)
         self._settle()
         self._refresh_cdp()
-        self._capture_step("start")
+        self._capture_step("start", force=True)
         return {"url": sanitize_url(self._page.url), "connected": self._connected}
 
     def _refresh_cdp(self) -> None:
@@ -298,6 +394,8 @@ class BrowserActor:
             except Exception:
                 pass
         self._cdp = self._context.new_cdp_session(self._page)
+        self._last_dom_hash = None
+        self._last_semantic_state = None
 
     def _attach_page(self, page: Any) -> None:
         identity = id(page)
@@ -409,14 +507,16 @@ class BrowserActor:
         if not self._connected or self._page is None or self._page.is_closed():
             raise RuntimeError("浏览器已崩溃、页面已关闭或 CDP 已断开")
 
-    def _settle(self) -> None:
+    def _settle(self) -> dict[str, Any] | None:
         self._ensure_live()
         deadline = time.monotonic() + 2.0
         previous = ""
         stable = 0
+        latest: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             try:
-                current = self._dom_hash()
+                latest = self._semantic_page_state()
+                current = str(latest["semantic_page_fingerprint"])
             except Exception:
                 break
             if current == previous:
@@ -427,6 +527,7 @@ class BrowserActor:
                 stable = 0
                 previous = current
             self._page.wait_for_timeout(150)
+        return latest
 
     def _dom_hash(self) -> str:
         parts: list[str] = []
@@ -449,17 +550,96 @@ class BrowserActor:
             except Exception as exc:
                 parts.append(f"FRAME_ERROR:{frame.url}:{exc}")
         content = "\nFRAME_BOUNDARY\n".join(parts)
-        return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        value = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        self._last_dom_hash = value
+        return value
 
-    def _capture_step(self, label: str) -> str:
+    def _semantic_page_state(self) -> dict[str, Any]:
+        elements: list[dict[str, Any]] = []
+        scroll_state: list[Any] = []
+        for frame_index, frame in enumerate(self._page.frames):
+            try:
+                value = frame.evaluate(
+                    """() => {
+                      const elements=[];
+                      const scrollables=[];
+                      const queue=[];
+                      for (const el of document.body?.children||[]) queue.push({el,hidden:false});
+                      let cursor=0;
+                      while (cursor<queue.length && cursor<12000 && elements.length<3000) {
+                        const current=queue[cursor++];
+                        const el=current.el;
+                        if (['SCRIPT','STYLE','NOSCRIPT','TEMPLATE'].includes(el.tagName)) continue;
+                        const style=getComputedStyle(el);
+                        const hidden=current.hidden||el.hidden||el.getAttribute('aria-hidden')==='true'||style.display==='none'||style.visibility==='hidden';
+                        if (!hidden) {
+                          for (const child of el.children) queue.push({el:child,hidden:false});
+                          if (el.shadowRoot) for (const child of el.shadowRoot.children) queue.push({el:child,hidden:false});
+                        }
+                        if (hidden) continue;
+                        const tag=el.tagName.toLowerCase();
+                        const role=el.getAttribute('role')||'';
+                        const directText=Array.from(el.childNodes).some(node => node.nodeType===Node.TEXT_NODE && (node.textContent||'').trim());
+                        const meaningful=directText||role||['a','button','input','select','textarea','option','li','tr','th','td','h1','h2','h3','h4','img','canvas','svg'].includes(tag);
+                        if (!meaningful) continue;
+                        let text=(el.textContent||'').replace(/\\s+/g,' ').trim();
+                        if (text.length>240) text=text.slice(0,240);
+                        elements.push({
+                          tag, role, text,
+                          label:el.getAttribute('aria-label')||el.getAttribute('alt')||el.getAttribute('title')||'',
+                          value:'value' in el?(el.type==='password'?'[REDACTED]':String(el.value||'').slice(0,160)):'',
+                          checked:'checked' in el?Boolean(el.checked):null,
+                          selected:'selected' in el?Boolean(el.selected):null,
+                          disabled:Boolean(el.disabled||el.getAttribute('aria-disabled')==='true'),
+                          href:el.href||'', type:el.type||'', name:el.name||''
+                        });
+                        if (el.scrollHeight>el.clientHeight) scrollables.push(el);
+                      }
+                      const scroll=[Math.round(scrollX),Math.round(scrollY)];
+                      for (const el of scrollables) {
+                        if (scroll.length>=22) break;
+                        scroll.push([el.getAttribute('role')||el.tagName,Math.round(el.scrollTop)]);
+                      }
+                      return {elements,scroll};
+                    }"""
+                )
+                for item in value.get("elements", []):
+                    item["frame"] = frame_index
+                    item["frame_url"] = sanitize_url(frame.url)
+                elements.extend(value.get("elements", []))
+                scroll_state.append([sanitize_url(frame.url), *value.get("scroll", [])])
+            except Exception:
+                continue
+        url = sanitize_url(self._page.url)
+        title = self._page.title()
+        fingerprint = semantic_page_fingerprint(url, title, elements, scroll_state=scroll_state)
+        state = {
+            "url": url,
+            "title": title,
+            "semantic_page_fingerprint": fingerprint,
+            "scroll_state": scroll_state,
+            "semantic_element_count": len(elements),
+        }
+        self._last_semantic_state = state
+        return state
+
+    def _capture_step(self, label: str, force: bool = False) -> str:
         self._ensure_live()
+        semantic = (self._last_semantic_state or self._semantic_page_state()).get("semantic_page_fingerprint")
+        if not force and semantic == self._last_capture_semantic and self._last_capture_path:
+            return self._last_capture_path
         index = self._step_counter
         self._step_counter += 1
         raw = self.output_dir / "trajectory" / f"{index:03d}.png"
         visual = self.output_dir / "trajectory_visual" / f"{index:03d}.png"
         self._page.screenshot(path=str(raw), full_page=False, timeout=30_000)
-        shutil.copy2(raw, visual)
-        return str(raw)
+        try:
+            os.link(raw, visual)
+        except OSError:
+            shutil.copy2(raw, visual)
+        self._last_capture_semantic = str(semantic)
+        self._last_capture_path = str(raw)
+        return self._last_capture_path
 
     async def observe(self) -> dict[str, Any]:
         return await self._call(self._observe_sync)
@@ -467,7 +647,12 @@ class BrowserActor:
     def _observe_sync(self) -> dict[str, Any]:
         self._assert_thread()
         self._ensure_live()
-        screenshot_path = self._capture_step("observe")
+        current_state = self._semantic_page_state()
+        screenshot_path = self._capture_step(
+            "observe",
+            force=self._last_observation_semantic != current_state["semantic_page_fingerprint"],
+        )
+        self._last_observation_semantic = str(current_state["semantic_page_fingerprint"])
         elements: list[dict[str, Any]] = []
         truncated = False
         browsergym_pre_extract(self._page, tags_to_mark="all", lenient=True)
@@ -491,13 +676,15 @@ class BrowserActor:
         finally:
             browsergym_post_extract(self._page)
         dom_hash = self._dom_hash()
-        artifact = self.output_dir / "observations" / f"{self._step_counter - 1:03d}.json.gz"
+        artifact = self.output_dir / "observations" / f"{self._observation_counter:03d}.json.gz"
+        self._observation_counter += 1
         with gzip.open(artifact, "wt", encoding="utf-8") as output:
             json.dump(
                 {
                     "url": sanitize_url(self._page.url),
                     "title": self._page.title(),
                     "dom_hash": dom_hash,
+                    "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
                     "elements": elements,
                     "elements_truncated": truncated,
                     "dom_snapshot": raw_snapshot,
@@ -509,6 +696,7 @@ class BrowserActor:
         payload = {
             "title": self._page.title(),
             "dom_hash": dom_hash,
+            "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
             "elements": elements,
             "element_count": len(elements),
             "truncated": truncated,
@@ -523,6 +711,7 @@ class BrowserActor:
             "url": sanitize_url(self._page.url),
             "title": self._page.title(),
             "dom_hash": dom_hash,
+            "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
             "elements": elements,
             "truncated": truncated,
             "evidence_id": evidence.evidence_id,
@@ -677,11 +866,13 @@ class BrowserActor:
         pages = [page for page in self._context.pages if not page.is_closed()]
         if action == "list":
             self._capture_step("tabs:list")
+            state = self._last_semantic_state or self._semantic_page_state()
             return {
                 "tabs": [
                     {"index": i, "url": sanitize_url(p.url), "active": p == self._page}
                     for i, p in enumerate(pages)
-                ]
+                ],
+                "semantic_page_fingerprint": state["semantic_page_fingerprint"],
             }
         if action == "switch":
             if index is None or index < 0 or index >= len(pages):
@@ -702,19 +893,30 @@ class BrowserActor:
                 raise ValueError("新建标签页必须提供 URL")
             if urlparse(url).scheme not in {"http", "https"}:
                 raise ValueError("新建标签页仅允许 http/https URL")
-            self._page = self._context.new_page()
-            self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            self._refresh_cdp()
+            target_url = canonical_url(url)
+            existing = next((page for page in pages if canonical_url(page.url) == target_url), None)
+            if existing is not None:
+                self._page = existing
+                self._page.bring_to_front()
+                self._refresh_cdp()
+                reused = True
+            else:
+                self._page = self._context.new_page()
+                self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                self._refresh_cdp()
+                reused = False
         else:
             raise ValueError("tabs action 仅支持 list/switch/close/new")
-        self._settle()
+        state = self._settle()
         self._capture_step(f"tabs:{action}")
         pages = [page for page in self._context.pages if not page.is_closed()]
         return {
             "tabs": [
                 {"index": i, "url": sanitize_url(p.url), "active": p == self._page}
                 for i, p in enumerate(pages)
-            ]
+            ],
+            "reused": reused if action == "new" else False,
+            "semantic_page_fingerprint": (state or self._semantic_page_state())["semantic_page_fingerprint"],
         }
 
     async def upload(self, bid: str, paths: list[str]) -> dict[str, Any]:
@@ -794,8 +996,35 @@ class BrowserActor:
         evidence = self.evidence_store.add(
             "dom", sanitize_url(self._page.url), f"结构化提取 {kind}", {"kind": kind, "bid": bid, "data": data}
         )
+        content_hash = hashlib.sha256(
+            json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()[:20]
+        state = self._semantic_page_state()
         self._capture_step(f"extract:{kind}")
-        return {"data": data, "evidence_id": evidence.evidence_id, "url": sanitize_url(self._page.url)}
+        return {
+            "data": data,
+            "evidence_id": evidence.evidence_id,
+            "url": sanitize_url(self._page.url),
+            "content_hash": content_hash,
+            "semantic_page_fingerprint": state["semantic_page_fingerprint"],
+        }
+
+    async def extract_many(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return await self._call(self._extract_many_sync, requests)
+
+    def _extract_many_sync(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._assert_thread()
+        results: list[dict[str, Any]] = []
+        for request in requests[:8]:
+            results.append(
+                self._extract_sync(
+                    str(request["kind"]),
+                    request.get("bid"),
+                    min(max(int(request.get("limit", 1_000)), 1), 5_000),
+                )
+            )
+        self._capture_step("extract_many")
+        return results
 
     async def network_events(self, since_last: bool = True) -> dict[str, Any]:
         return await self._call(self._network_events_sync, since_last)
@@ -843,7 +1072,8 @@ class BrowserActor:
     def _visual_crop_sync(self, bid: str, question: str) -> dict[str, Any]:
         self._assert_thread()
         locator = self._locator(bid)
-        path = self.output_dir / "trajectory_visual" / f"visual-{self._step_counter:03d}.png"
+        path = self.output_dir / "trajectory_visual" / f"visual-{self._visual_counter:03d}.png"
+        self._visual_counter += 1
         locator.screenshot(path=str(path), timeout=30_000)
         self._capture_step("visual:element")
         evidence = self.evidence_store.add(
@@ -863,7 +1093,10 @@ class BrowserActor:
         page_count = len(PdfReader(str(target)).pages)
         if page_number < 1 or page_number > page_count:
             raise ValueError("PDF 页码越界")
-        output_prefix = self.output_dir / "trajectory_visual" / f"document-{page_number:03d}"
+        output_prefix = self.output_dir / "trajectory_visual" / (
+            f"document-{self._visual_counter:03d}-page-{page_number:03d}"
+        )
+        self._visual_counter += 1
         try:
             subprocess.run(
                 [
@@ -900,7 +1133,7 @@ class BrowserActor:
         return {"path": str(output), "question": question, "evidence_id": evidence.evidence_id}
 
     async def audit_step(self, label: str) -> str:
-        return await self._call(self._capture_step, label)
+        return await self._call(self._capture_step, label, label in {"finish", "record_coverage"})
 
     def _element_state(self, locator: Any) -> dict[str, Any]:
         return locator.evaluate(
@@ -914,7 +1147,8 @@ class BrowserActor:
         try:
             self._ensure_live()
             before_url = self._page.url
-            before_hash = self._dom_hash()
+            before_hash = self._last_dom_hash or ""
+            before_semantic = self._semantic_page_state()
         except Exception as exc:
             receipt = ActionReceipt(
                 action_id,
@@ -934,15 +1168,17 @@ class BrowserActor:
         stale = False
         error: str | None = None
         postconditions: dict[str, Any] = {}
+        settled_state: dict[str, Any] | None = None
+        after_semantic = before_semantic
         try:
             postconditions.update(operation())
-            self._settle()
+            settled_state = self._settle()
             pages = [page for page in self._context.pages if not page.is_closed()]
             if len(pages) > pages_before:
                 self._page = pages[-1]
                 self._page.bring_to_front()
                 self._refresh_cdp()
-                self._settle()
+                settled_state = self._settle()
             success = True
         except Exception as exc:
             stale = "STALE_BID" in str(exc)
@@ -950,10 +1186,24 @@ class BrowserActor:
             success = False
         try:
             after_url = self._page.url
-            after_hash = self._dom_hash()
-            page_text = self._page.locator("body").inner_text(timeout=2_000)[:50_000]
+            after_hash = before_hash
+            after_semantic = settled_state or self._semantic_page_state()
+            target = postconditions.get("target", {})
+            target_text = " ".join(str(target.get(key, "")) for key in ("type", "text", "value"))
+            may_submit = (
+                action == "press" and str(postconditions.get("key", "")).lower() in {"enter", "return"}
+            ) or (
+                action == "click"
+                and (target.get("type") == "submit" or bool(_SUBMIT_TARGET.search(target_text)))
+            )
+            page_text = (
+                self._page.locator("body").inner_text(timeout=2_000)[:50_000]
+                if may_submit
+                else ""
+            )
         except Exception as exc:
             after_url, after_hash, page_text = before_url, before_hash, ""
+            after_semantic = before_semantic
             self._connected = False
             success = False
             error = error or sanitize_exception(exc)
@@ -966,10 +1216,20 @@ class BrowserActor:
                 "confirmation": self._is_confirmed_submission(
                     action,
                     success,
-                    before_url != after_url or before_hash != after_hash,
+                    before_url != after_url
+                    or before_semantic["semantic_page_fingerprint"]
+                    != after_semantic["semantic_page_fingerprint"],
                     postconditions,
                     page_text,
                 ),
+                "before_semantic_page_fingerprint": before_semantic["semantic_page_fingerprint"],
+                "after_semantic_page_fingerprint": after_semantic["semantic_page_fingerprint"],
+                "post_observation": {
+                    "url": sanitize_url(after_url),
+                    "title": after_semantic["title"],
+                    "semantic_page_fingerprint": after_semantic["semantic_page_fingerprint"],
+                    "semantic_element_count": after_semantic["semantic_element_count"],
+                },
             }
         )
         public_postconditions = redact_value(postconditions)
