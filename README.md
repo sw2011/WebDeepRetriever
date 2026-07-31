@@ -1,280 +1,333 @@
-<h1 align="center">🌐 WebRetriever: A Large-Scale Comprehensive Benchmark for Efficient Web Agent Evaluation</h1>
-<p align="center">
-<a href="https://arxiv.org/abs/2607.06118">📃 Paper</a>
-•
-<a href="https://mininglamp-ai.github.io/WebRetriever/">🏆 Leaderboard</a>
-•
-<a href="https://huggingface.co/datasets/Mininglamp-2718/WebRetriever">🤗 Data</a>
-•
-🔤 English | <a href="https://github.com/Mininglamp-AI/WebRetriever/blob/main/README_zh.md">中文</a>
-</p>
+# WebDeepRetriever
 
+WebDeepRetriever 是一套可审计、可并发、可验证完成状态的网页智能体。它通过 Playwright 连接外部 Chrome DevTools Protocol（CDP）浏览器，使用 OpenAI 兼容模型完成网页操作，并以 DOM/无障碍树、浏览器触发的网络响应、文档内容、局部视觉结果和动作回执作为答案证据。
 
-## 💡 Motivation
-<p align="center">
-  <img src="docs/static/images/motivation.png" alt="Motivation for the WebRetriever benchmark." width="80%">
-</p>
-<p align="center"><em>Figure 1. Motivation for the WebRetriever benchmark. WebRetriever addresses key limitations of prior work from three aspects: dataset scale and diversity, automated evaluation reliability, and deployment-oriented evaluation protocols.</em>
-</p>
+项目默认运行链路位于 `src/web_agent/`，包含浏览器观察与操作、模型工具循环、完成验证、多进程任务调度和离线结果评测。
 
-> **Current Protocol III default:** `src/agent/main.py` and `scripts/run_agent.sh` now use
-> the verified `web_agent` implementation built on Playwright CDP, vendored BrowserGym
-> DOM/AX observations, and OpenAI Agents. The legacy `src/agent/agent.py` is not imported
-> or called by the default path. See `MANUAL_TESTING.md`, `DEPLOYMENT.md`, and
-> `ACCEPTANCE.md` for the current runbook and recorded acceptance results.
+## 核心能力
 
----
+- 通过 Playwright `connect_over_cdp()` 连接 1 到 8 个相互独立的外部浏览器。
+- 基于 BrowserGym DOM/AX 观察生成稳定 `bid`，使用 Locator 执行点击、填写、选择、滚动、上传、下载和标签页操作，不提供坐标点击入口。
+- 采集页面结构、浏览器真实触发的有界 XHR/Fetch、下载文档和动作回执；只有结构化信息不足时才允许局部视觉降级。
+- 由 `CompletionVerifier` 校验答案非空、证据引用、字段绑定、表单确认和全量任务覆盖证明；只有完成契约通过验证的 `finish` 才会产生 `SUCCESS`。
+- 每个任务最多 100 个工具步骤，模型请求零重试；`result.json`、`evidence.json` 和汇总文件采用临时文件替换写入，已完成任务可断点续跑。
+- 提供 Protocol III 数据剖析、确定性分层抽样，以及 exact/normalized 离线答案对比。
+- 对 URL、凭据、错误和网络证据进行有界记录与脱敏。
 
-## 🏗️ Project Structure
+## 整体架构
 
-```
-WebRetriever/
-├── data/                           # Task data
-│   └── example_tasks.json          # Example tasks (3 samples)
-├── scripts/                        # Launch scripts
-│   ├── run_agent.sh                # Run agent evaluation
-│   ├── run_online_service_multi.sh # Start local VLM inference services
-│   ├── create_sandbox.sh           # Create cloud sandbox browsers
-│   └── run_naveval.sh              # Run NavEval automated evaluation
-├── src/
-│   ├── agent/                      # Web agent (UI-TARS 1.5 example)
-│   │   ├── agent.py                # Agent core: VLM interaction, history, action parsing
-│   │   ├── main.py                 # Multi-process task runner
-│   │   ├── web_controller.py       # Browser control via Playwright + CDP
-│   │   ├── prompts.py              # Prompt templates and action space definitions
-│   │   ├── app.py                  # Local VLM serving (Qwen2.5-VL / Qwen3-VL)
-│   │   ├── config.py               # Sandbox configuration loader
-│   │   ├── create_sandbox.py       # Tencent Cloud AGS sandbox creator
-│   │   └── .env.example            # Environment variables template
-│   └── eval/                       # NavEval evaluation framework
-│       ├── naveval.py              # Main evaluation script
-│       ├── agents/                 # Evaluation agents
-│       ├── common/                 # Filters and formatters
-│       └── util/                   # Utility functions
-└── docs/                           # Documentation & leaderboard site
+```mermaid
+flowchart LR
+    A["Protocol III 任务 JSON"] --> B["CLI / Runner"]
+    B --> C1["Worker 1"]
+    B --> C2["Worker 2...8"]
+    C1 --> D1["ProtocolIIIAgent"]
+    C2 --> D2["ProtocolIIIAgent"]
+    D1 <--> E1["BrowserActor"]
+    D2 <--> E2["BrowserActor"]
+    E1 <--> F1["外部 Chrome CDP 1"]
+    E2 <--> F2["外部 Chrome CDP 2...8"]
+    D1 --> G["CompletionVerifier"]
+    D2 --> G
+    G --> H["result.json + 证据 + 轨迹"]
 ```
 
-## 🚀 Quick Start
+运行时职责：
 
-### Prerequisites
+| 模块 | 职责 |
+| --- | --- |
+| `src/web_agent/cli.py` | 命令行参数、环境变量和健康检查入口 |
+| `src/web_agent/runner.py` | 多进程分片、每个 CDP 一个 Worker、断点续跑和结果汇总 |
+| `src/web_agent/runtime.py` | 模型工具循环、上下文裁剪、工具步数限制、Kimi K2.6 参数兼容 |
+| `src/web_agent/browser_actor.py` | CDP 连接、DOM/AX 观察、页面动作、网络/文档/视觉证据和审计产物 |
+| `src/web_agent/contracts.py` | 任务契约、动作回执、证据引用和覆盖证书 |
+| `src/web_agent/verifier.py` | 完成条件与证据一致性验证 |
+| `src/web_agent/protocol3_eval.py` | 数据剖析、分层抽样和离线答案对比 |
+| `src/web_agent/sanitization.py` | URL、密钥、错误、请求和响应脱敏 |
+
+## 项目结构
+
+```text
+WebDeepRetriever/
+├── src/web_agent/                 # 当前默认 Protocol III 实现
+├── tests/                         # 单元测试与真实 Chrome/CDP 集成测试
+├── vendor/browsergym/             # 固定版本的 BrowserGym DOM/AX 观察依赖
+├── data/example_tasks.json        # 最小任务示例
+├── evaluation/                    # 评测样本、报告和对比结果
+├── scripts/run_agent.sh           # 本地运行脚本
+├── Dockerfile
+├── docker-compose.yml
+├── DEPLOYMENT.md                  # 完整部署说明
+├── MANUAL_TESTING.md              # 本地与真实浏览器验收说明
+└── ACCEPTANCE.md                  # 已执行验收记录
+```
+
+## 环境要求
+
+- Python 3.10 或更高版本。
+- 一个已安装并可单独启动的 Chrome/Chromium 浏览器，或比赛方提供的外部 CDP 地址。
+- 可用的 OpenAI 兼容 Chat Completions API、支持工具调用的模型和 API Key；使用视觉降级时模型还需支持图像输入。
+- 扫描 PDF 视觉降级需要 Poppler；Docker 镜像已安装 `poppler-utils`。
+- Docker 部署需要 Docker Engine 与 Docker Compose v2。
+
+正式 Agent 仅允许通过 Playwright 操作网页。项目不需要执行 `playwright install`，正式 Docker 镜像也不会下载、安装或启动浏览器。
+
+## 本地安装
 
 ```bash
-pip install playwright openai numpy opencv-python Pillow
-playwright install chromium
+cd WebDeepRetriever
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[test]'
 ```
 
-### 1. Data Preparation
+安装后可使用两个控制台命令：
 
-Download the task dataset from Hugging Face:
+- `webdeepretriever`：运行 Agent。
+- `webdeepretriever-eval`：执行 Protocol III 离线评测工具。
 
-```bash
-# Install git-lfs if not already installed
-git lfs install
+也可使用等价模块入口 `python -m web_agent.cli` 和 `python -m web_agent.protocol3_eval`。
 
-# Clone the dataset
-git clone https://huggingface.co/datasets/Mininglamp-2718/WebRetriever data/
-```
+## 启动外部浏览器
 
-The dataset contains task files organized by evaluation protocol. Place the downloaded JSON files in the `data/` directory and set the `INPUT` path in `scripts/run_agent.sh` accordingly.
+每个 Worker 必须使用独立端口和独立用户目录。下面的命令只启动本地浏览器，不会主动访问目标网站。
 
-> See the [🤗 Hugging Face dataset page](https://huggingface.co/datasets/Mininglamp-2718/WebRetriever) for detailed protocol descriptions and data format documentation.
-
-### 2. Browser Connection (3 Modes)
-
-WebRetriever uses [Playwright](https://playwright.dev/python/) for all browser interactions via [CDP (Chrome DevTools Protocol)](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp). For detailed Playwright API usage, see the [Playwright Python documentation](https://playwright.dev/python/docs/intro).
-
-#### Mode A: Local Browser
-
-Launch Chrome with a remote debugging port:
+macOS：
 
 ```bash
-# macOS
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-    --remote-debugging-port=9222 \
-    --user-data-dir="/tmp/chrome-debug-profile"
-
-# Linux
-google-chrome --remote-debugging-port=9222 \
-    --user-data-dir="/tmp/chrome-debug-profile" \
-    --no-first-run --no-sandbox
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/webdeepretriever-chrome-9222 \
+  --no-first-run about:blank
 ```
 
-Verify the connection:
+Linux：
+
 ```bash
-curl http://localhost:9222/json/version
+google-chrome \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/webdeepretriever-chrome-9222 \
+  --no-first-run about:blank
 ```
 
-Then configure in `scripts/run_agent.sh`:
+可以用项目实际使用的 Playwright 传输验证连接：
+
 ```bash
-CDP_URLS=(
-    "http://localhost:9222"
-)
+.venv/bin/python - <<'PY'
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+    print({"connected": browser.is_connected(), "contexts": len(browser.contexts)})
+PY
 ```
 
-#### Mode B: Remote Browser
+容器连接宿主机 Chrome 时，浏览器需监听容器可达地址，并通过防火墙限制调试端口的访问范围。生产环境应直接使用受控的比赛方或基础设施 CDP 地址。
 
-Same as Mode A, but launch Chrome on a remote server with `--remote-allow-origins=*` and set `CDP_URLS` to the remote IP (e.g., `http://YOUR_REMOTE_IP:9222`).
+## 配置
 
-#### Mode C: Tencent Cloud AGS Sandbox
-
-Cloud-hosted browser sandboxes with built-in isolation:
-
-1. Copy and fill in your credentials:
-   ```bash
-   cp src/agent/.env.example src/agent/.env
-   # Edit .env with your Tencent Cloud AGS credentials
-   ```
-
-2. Create sandboxes:
-   ```bash
-   bash scripts/create_sandbox.sh 4    # Create 4 sandbox instances
-   ```
-
-3. The script generates `sandbox_list.json` with CDP URLs. Copy the URLs into `scripts/run_agent.sh`:
-   ```bash
-   CDP_URLS=(
-       "https://9000-xxx.tencentags.com/cdp?access_token=sit_xxx"
-       "https://9000-yyy.tencentags.com/cdp?access_token=sit_yyy"
-       # ... paste from sandbox_list.json
-   )
-   ```
-
-> **Note:** Sandbox authentication is handled automatically — `web_controller.py` detects the `access_token` parameter from the URL and sets the required CDP headers.
-
-### 3. Model Setup
-
-The agent supports both **open-source (local)** and **proprietary (API)** models.
-
-#### Open-Source Models (Local Deployment)
-
-The included `app.py` provides a lightweight OpenAI-compatible inference server that supports **Qwen2.5-VL** and **Qwen3-VL** models. Launch one service per GPU:
+先复制配置模板：
 
 ```bash
-# 1. Edit MODEL_PATH in the script to point to your model weights
-# 2. Start services (8 GPUs → 8 services on ports 8001-8008)
-bash scripts/run_online_service_multi.sh
+cp .env.example .env
 ```
 
-You can also use [vLLM](https://docs.vllm.ai/) or any other OpenAI-compatible serving framework as an alternative.
+| 环境变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 是 | 模型 API 密钥 |
+| `OPENAI_BASE_URL` | 否 | OpenAI 兼容 API 地址，默认 `https://api.openai.com/v1` |
+| `WEBRETRIEVER_MODEL` | 否 | 模型名称，默认 `gpt-4.1-mini` |
+| `WEBRETRIEVER_CDP_URLS` | 是 | 1 到 8 个互不相同的 CDP URL，以英文逗号分隔 |
+| `WEBRETRIEVER_MAX_STEPS` | 否 | 单任务最大工具步数，运行时限制为 1 到 100 |
+| `WEBRETRIEVER_UPLOAD_ROOTS` | 否 | 允许上传的目录白名单 |
+| `WEBRETRIEVER_INPUT_HOST` | Compose 必填 | 宿主机任务 JSON 路径 |
+| `WEBRETRIEVER_OUTPUT_HOST` | 否 | Compose 宿主机输出目录，默认 `./output` |
 
-Then in `scripts/run_agent.sh`:
+不要把真实密钥或带凭据的 CDP URL 提交到仓库。
+
+## 运行 Agent
+
+直接使用 CLI：
+
 ```bash
-MODEL="uitars"                                     # --served-model-name
-VLM_PORTS="8001 8002 8003 8004 8005 8006 8007 8008" # Local service ports
+OPENAI_API_KEY='替换为实际密钥' \
+.venv/bin/python -m web_agent.cli \
+  --input data/example_tasks.json \
+  --output output \
+  --cdp_url http://127.0.0.1:9222 \
+  --model gpt-4.1-mini \
+  --api_base https://api.openai.com/v1 \
+  --max_steps 100
 ```
 
-Each worker is assigned a VLM port via round-robin (`worker_id % num_ports`).
-
-#### Proprietary Models (API)
-
-For proprietary models (e.g., GPT-4o, Claude), configure the API endpoint directly in `scripts/run_agent.sh`:
+或使用环境变量与启动脚本：
 
 ```bash
-API_BASE="https://api.openai.com/v1"
-API_KEY="your-api-key"
-MODEL="gpt-4o"
-VLM_PORTS=""                                        # Leave empty for API mode
-```
-
-All workers share the same API endpoint.
-
-### 4. Agent Evaluation
-
-The `src/agent/` directory provides a **complete working example** built on [UI-TARS 1.5](https://github.com/bytedance/UI-TARS).
-
-#### Run
-
-```bash
+export OPENAI_API_KEY='替换为实际密钥'
+export OPENAI_BASE_URL='https://api.openai.com/v1'
+export WEBRETRIEVER_MODEL='gpt-4.1-mini'
+export WEBRETRIEVER_CDP_URLS='http://127.0.0.1:9222'
 bash scripts/run_agent.sh
 ```
 
-**Configuration options in `run_agent.sh`:**
+并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
 
-| Parameter | Description |
-|-----------|-------------|
-| `INPUT` | Task JSON file path (e.g., `data/example_tasks.json`) |
-| `OUTPUT` | Output directory for trajectories and results |
-| `CDP_URLS` | Browser CDP URL array (number of URLs = number of parallel workers) |
-| `MODEL` | Model name |
-| `VLM_PORTS` | Local VLM service ports (for open-source models) |
-| `API_BASE` / `API_KEY` | API endpoint and key (for proprietary models) |
-
-**Parallelism:** The number of `CDP_URLS` determines the number of parallel workers. Each worker connects to one browser instance.
-
-**Resume:** The runner automatically skips completed tasks (those with `result.json` containing `"status": "SUCCESS"`), enabling safe restart after interruptions.
-
-#### Task Format
-
-See the downloaded dataset in `data/` for the input format and examples.
-
-#### Output Structure
-
-```
-output/
-├── locks/                          # Multi-process coordination locks
-├── 0_f0fe04a2.../
-│   ├── trajectory/                 # Raw screenshots at each step (0.png, 1.png, ...)
-│   ├── trajectory_visual/          # Annotated screenshots with action overlays
-│   ├── result.json                 # Task result: status, actions, thoughts, URLs
-│   └── capture.json                # Captured XHR/Fetch network requests
-└── logs/
-    └── worker_0_YYYYMMDD.log       # Per-worker log files
-```
-
-### 5. NavEval Evaluation
-
-NavEval provides automated evaluation of agent trajectories with 91.2% human agreement.
-
-#### Run
+健康检查只验证安装和入口，不探测浏览器、模型或网站：
 
 ```bash
-# Edit API credentials in run_naveval.sh first
-bash scripts/run_naveval.sh
+.venv/bin/python -m web_agent.cli --healthcheck
 ```
 
-#### How It Works
+预期输出：
 
-NavEval operates in two stages:
-- **Filter stage:** Extracts and filters relevant XHR/Fetch requests from captured network traffic, removing noise (static assets, analytics, etc.)
-- **Eval stage:** Uses an LLM judge to evaluate task completion based on rich interaction context including network requests, action sequences, and page URLs
-
-#### Configuration
-
-| Parameter | Description |
-|-----------|-------------|
-| `--mode` | `filter`, `eval`, or `both` |
-| `--test-dir` | Directory containing agent output (with `result.json` and `capture.json`) |
-| `--save-dir` | Directory to save evaluation results |
-| `--max-workers` | Number of parallel evaluation workers |
-| `--api-key` / `--api-base` | LLM API credentials for the judge model |
-| `--model` | Judge model name (e.g., `claude-sonnet-4-5`) |
-
-### 6. Building Your Own Agent
-
-The provided `src/agent/` is a reference implementation based on UI-TARS 1.5. To integrate your own model:
-
-**Customize `agent.py`** — Modify the VLM interaction logic to work with your model.
-
-**Customize `web_controller.py`** — Extend browser control if your model uses a different action space.
-
-The `main.py` task runner generally does not need modification — it handles multi-process scheduling, browser lifecycle, screenshot capture, and result saving.
-
-## 📖 Citation
-
-If you find WebRetriever useful for your research, please consider citing our paper:
-
-```bibtex
-@misc{dong2026webretrieverlargescalecomprehensivebenchmark,
-    title={WebRetriever: A Large-Scale Comprehensive Benchmark for Efficient Web Agent Evaluation}, 
-    author={Wei Dong and Tianyu Fu and Zhe Yu and Hanning Wang and Anyang Su and Zhizhou Fang and Yuyang Chen and Shuo Wang and Minghui Wu and Ping Jiang and Zhen Lei and Chenxu Zhao},
-    year={2026},
-    eprint={2607.06118},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2607.06118}, 
-}
+```json
+{"status": "ok", "playwright_transport": "cdp", "max_workers": 8}
 ```
 
-## 📜 License
+## Docker Compose 部署
 
-This project is released under the [MIT License](LICENSE).
+Docker 镜像只包含 Agent 和 Playwright 客户端，浏览器必须在容器外部运行。
+
+```bash
+cp .env.example .env
+# 填写 .env 中的模型、CDP、输入和输出配置
+docker compose up --build --abort-on-container-exit
+```
+
+Compose 将单个任务 JSON 只读挂载到 `/work/input/tasks.json`，结果持久化到 `/work/output`。容器以 UID/GID `10001:10001` 运行，启动前需确保宿主机输出目录可写。
+
+macOS/Windows 的宿主机 CDP 通常填写 `http://host.docker.internal:9222`；Linux Compose 已配置 `host-gateway`。远程或比赛环境应填写实际受控 CDP URL。
+
+本地 CLI 可让 Chrome 仅监听 `127.0.0.1`；容器联调不能使用这个监听地址。容器需要访问宿主机 Chrome 时，应在前述启动命令中改用以下参数，并通过防火墙把 9222 端口限制在本机和容器网段：
+
+```text
+--remote-debugging-address=0.0.0.0
+--remote-allow-origins=*
+```
+
+镜像自检：
+
+```bash
+docker build -t webdeepretriever:protocol3 .
+docker run --rm webdeepretriever:protocol3 --healthcheck
+```
+
+更多网络边界、直接运行容器和运维说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+## 输入格式
+
+运行输入必须是 JSON 数组。每条任务使用以下字段；离线标准数据可以额外包含 `answer`：
+
+```json
+[
+  {
+    "task_idx": 0,
+    "task_id": "example-task-id",
+    "website": "https://example.com",
+    "task": "读取页面中的目标信息并返回答案"
+  }
+]
+```
+
+Runner 使用 `<task_idx>_<task_id>` 作为任务目录名，因此生成后的目录名必须唯一。当前代码不会清理标识符，输入方还必须确保 `task_idx` 和 `task_id` 不包含 `/`、`\`、`..` 等路径片段。仓库中的 [data/example_tasks.json](data/example_tasks.json) 可直接作为结构参考；其中任务会访问真实网站，运行前仍需确认访问权限、登录状态和模型额度。完整任务数据需要按实际运行环境准备。
+
+## 输出与成功口径
+
+每个任务输出到 `<task_idx>_<task_id>/`：
+
+```text
+output/
+├── <task_idx>_<task_id>/
+│   ├── result.json
+│   ├── evidence.json
+│   ├── capture.json
+│   ├── trajectory/
+│   ├── trajectory_visual/
+│   ├── observations/
+│   └── downloads/
+└── logs/
+    ├── worker_<id>.log
+    └── summary.json
+```
+
+`result.json` 保存 `agent_answer`、状态、动作、动作执行摘要、访问 URL、动作回执、证据绑定和覆盖证书。`capture.json` 记录本任务所有已附加页面通过浏览器触发的有界 XHR/Fetch，并对敏感字段脱敏。
+
+主要状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `SUCCESS` | `finish` 已通过完成契约和证据结构验证；不代表答案语义正确 |
+| `FAIL_MAX_STEPS` | 达到最大工具步数且没有通过验证的 `finish` |
+| `FAIL_UNVERIFIED_FINISH` | Agent 结束，但没有获得验证通过的 `finish` |
+| `FAIL_AGENT_ERROR` | 模型调用或 Agent 工具循环失败 |
+| `FAIL_BROWSER_ERROR` | CDP 连接、任务页面初始化等浏览器启动阶段失败 |
+
+进程正常退出不等于任务成功，`SUCCESS` 也不等于答案正确。答案正确率仍需通过标准答案的 exact/normalized 离线对比确定；离线评测只应读取真实落盘结果并保留失败状态。
+
+## Protocol III 离线评测
+
+数据剖析：
+
+```bash
+.venv/bin/python -m web_agent.protocol3_eval profile \
+  --input /path/to/protocol3.json \
+  --output /tmp/protocol3.profile.json
+```
+
+生成确定性分层样本：
+
+```bash
+.venv/bin/python -m web_agent.protocol3_eval sample \
+  --input /path/to/protocol3.json \
+  --output /tmp/protocol3.sample.json \
+  --report /tmp/protocol3.sample.report.json \
+  --size 8 \
+  --seed 20260726
+```
+
+对比已经落盘的结果：
+
+```bash
+.venv/bin/python -m web_agent.protocol3_eval compare \
+  --input /path/to/protocol3.json \
+  --results /path/to/output \
+  --unrun-reasons /path/to/unrun-reasons.json \
+  --output /tmp/protocol3.comparison.json \
+  --csv /tmp/protocol3.comparison.csv
+```
+
+报告会分别统计 `executed_tasks`、`successful_results`、`comparable_tasks`、exact 和 normalized。normalized 仅执行 Unicode NFKC、大小写与空白规范化，不改变列表顺序或数值类型。未运行、运行失败、成功但无可比较答案必须分别报告，不能用离线数据剖析代替真实端到端成绩。
+
+固定 8 条 Kimi K2.6 真实运行的事实记录见 [evaluation/KIMI_K2_6_REAL_TEST_20260726.md](evaluation/KIMI_K2_6_REAL_TEST_20260726.md)。该次结果为 0 条可比较答案：7 条受 Moonshot 组织级 3,000,000 TPM 配额限制，1 条在 SEC 站点受限后耗尽 100 步。因此它既不能外推为 100 条总体准确率，也不能单独解释为模型语义能力结论。
+
+## 测试与验收
+
+无需 Chrome 的单元测试：
+
+```bash
+.venv/bin/python -m pytest -q -m 'not integration'
+```
+
+完整单元测试与真实 Chrome/CDP 集成测试：
+
+```bash
+WEB_AGENT_REQUIRE_CHROME=1 .venv/bin/python -m pytest -q
+```
+
+浏览器集成测试覆盖 DOM/AX、iframe、开放 Shadow DOM、SPA、分页、虚拟列表、局部视觉、弹窗、标签页、上传下载、PDF、浏览器网络证据与线程亲和性。详细验收步骤见 [MANUAL_TESTING.md](MANUAL_TESTING.md)，历史执行记录见 [ACCEPTANCE.md](ACCEPTANCE.md) 和 [Kimi K2.6 真实测试记录](evaluation/KIMI_K2_6_REAL_TEST_20260726.md)。
+
+## 已知限制与安全边界
+
+- 真实站点的登录、区域限制、反自动化、限流和临时不可用会直接影响任务结果，必须逐任务记录，不能归因成统一的模型准确率。
+- 每个 Worker 需要独立浏览器状态；并发数还必须服从模型服务的 RPM/TPM 配额。
+- closed Shadow DOM 无法通过页面标准 DOM 接口遍历；Canvas、图片、图表和扫描 PDF 只提供受限的局部视觉降级。
+- 全量任务依赖可验证的分页、游标、虚拟列表终止条件或页面声明总数；无法证明覆盖时不会返回 `SUCCESS`。
+- CDP URL 可能包含访问凭据，调试端口等同于浏览器控制权限，不应暴露到公网。
+- 默认执行链路只通过 Playwright 与受控浏览器交互，不使用外部搜索引擎、裸 CDP 客户端，也不通过主动网站 HTTP/API 请求绕过浏览器交互。
+
+## 第三方依赖与许可
+
+项目 vendoring 的 BrowserGym 来源、版本和文件校验记录见 [vendor/browsergym/SOURCE.md](vendor/browsergym/SOURCE.md)，其许可证见 [vendor/browsergym/LICENSE](vendor/browsergym/LICENSE)。完整第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+仓库当前未包含项目自身的顶层许可证文件；对外发布或分发前应先补充明确的授权条款。
