@@ -1,10 +1,8 @@
 # WebDeepRetriever
 
-WebDeepRetriever 是面向 [WebRetriever](https://arxiv.org/abs/2607.06118) Protocol III 的可审计网页智能体实现。它通过 Playwright 连接外部 Chrome DevTools Protocol（CDP）浏览器，使用 OpenAI 兼容模型完成网页操作，并以 DOM/无障碍树、浏览器触发的网络响应、文档内容、局部视觉结果和动作回执作为答案证据。
+WebDeepRetriever 是一套可审计、可并发、可验证完成状态的网页智能体。它通过 Playwright 连接外部 Chrome DevTools Protocol（CDP）浏览器，使用 OpenAI 兼容模型完成网页操作，并以 DOM/无障碍树、浏览器触发的网络响应、文档内容、局部视觉结果和动作回执作为答案证据。
 
-当前默认运行链路位于 `src/web_agent/`。`src/agent/main.py` 仅保留为兼容入口，历史 UI-TARS 与 NavEval 代码不参与默认执行。
-
-相关资源：[论文](https://arxiv.org/abs/2607.06118) · [数据集](https://huggingface.co/datasets/Mininglamp-2718/WebRetriever) · [排行榜](https://mininglamp-ai.github.io/WebRetriever/)
+项目默认运行链路位于 `src/web_agent/`，包含浏览器观察与操作、模型工具循环、完成验证、多进程任务调度和离线结果评测。
 
 ## 核心能力
 
@@ -52,8 +50,6 @@ flowchart LR
 ```text
 WebDeepRetriever/
 ├── src/web_agent/                 # 当前默认 Protocol III 实现
-├── src/agent/                     # 兼容入口与历史 Agent 代码
-├── src/eval/                      # 历史 NavEval 代码，不在默认链路中
 ├── tests/                         # 单元测试与真实 Chrome/CDP 集成测试
 ├── vendor/browsergym/             # 固定版本的 BrowserGym DOM/AX 观察依赖
 ├── data/example_tasks.json        # 最小任务示例
@@ -79,7 +75,7 @@ WebDeepRetriever/
 ## 本地安装
 
 ```bash
-cd /Users/admin/Desktop/webRetriever/WebDeepRetriever
+cd WebDeepRetriever
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
 ```
@@ -101,7 +97,7 @@ macOS：
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/webretriever-chrome-9222 \
+  --user-data-dir=/tmp/webdeepretriever-chrome-9222 \
   --no-first-run about:blank
 ```
 
@@ -111,7 +107,7 @@ Linux：
 google-chrome \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/webretriever-chrome-9222 \
+  --user-data-dir=/tmp/webdeepretriever-chrome-9222 \
   --no-first-run about:blank
 ```
 
@@ -234,7 +230,7 @@ docker run --rm webdeepretriever:protocol3 --healthcheck
 ]
 ```
 
-Runner 使用 `<task_idx>_<task_id>` 作为任务目录名，因此生成后的目录名必须唯一。当前代码不会清理标识符，输入方还必须确保 `task_idx` 和 `task_id` 不包含 `/`、`\`、`..` 等路径片段。仓库中的 [data/example_tasks.json](data/example_tasks.json) 可直接作为结构参考；其中任务会访问真实网站，运行前仍需确认访问权限、登录状态和模型额度。完整 Protocol III 数据需要从上方数据集链接单独获取。
+Runner 使用 `<task_idx>_<task_id>` 作为任务目录名，因此生成后的目录名必须唯一。当前代码不会清理标识符，输入方还必须确保 `task_idx` 和 `task_id` 不包含 `/`、`\`、`..` 等路径片段。仓库中的 [data/example_tasks.json](data/example_tasks.json) 可直接作为结构参考；其中任务会访问真实网站，运行前仍需确认访问权限、登录状态和模型额度。完整任务数据需要按实际运行环境准备。
 
 ## 输出与成功口径
 
@@ -328,10 +324,10 @@ WEB_AGENT_REQUIRE_CHROME=1 .venv/bin/python -m pytest -q
 - closed Shadow DOM 无法通过页面标准 DOM 接口遍历；Canvas、图片、图表和扫描 PDF 只提供受限的局部视觉降级。
 - 全量任务依赖可验证的分页、游标、虚拟列表终止条件或页面声明总数；无法证明覆盖时不会返回 `SUCCESS`。
 - CDP URL 可能包含访问凭据，调试端口等同于浏览器控制权限，不应暴露到公网。
-- 项目不使用 UI-TARS、AnySearch、外部搜索引擎、裸 CDP 客户端，也不通过主动网站 HTTP/API 请求绕过浏览器交互。
+- 默认执行链路只通过 Playwright 与受控浏览器交互，不使用外部搜索引擎、裸 CDP 客户端，也不通过主动网站 HTTP/API 请求绕过浏览器交互。
 
 ## 第三方依赖与许可
 
 项目 vendoring 的 BrowserGym 来源、版本和文件校验记录见 [vendor/browsergym/SOURCE.md](vendor/browsergym/SOURCE.md)，其许可证见 [vendor/browsergym/LICENSE](vendor/browsergym/LICENSE)。完整第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-仓库当前未包含项目自身的顶层许可证文件；对外发布或分发前应先补充明确的授权条款。引用 WebRetriever 基准时请使用原论文提供的引用信息。
+仓库当前未包含项目自身的顶层许可证文件；对外发布或分发前应先补充明确的授权条款。
