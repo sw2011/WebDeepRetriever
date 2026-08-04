@@ -27,7 +27,6 @@ from web_agent.runtime import (
     _answer_shape_reasons,
     _error,
     _json,
-    _kimi_request_options,
     _model_settings,
     _project_observation,
     _tool_failure,
@@ -109,11 +108,6 @@ def test_kimi_k26_uses_tool_compatible_settings() -> None:
     default_settings = _model_settings("gpt-4.1-mini")
     assert default_settings.temperature == 0
     assert default_settings.extra_body is None
-    assert _kimi_request_options("kimi-k2.6") == {
-        "temperature": 0.6,
-        "extra_body": {"thinking": {"type": "disabled"}},
-    }
-    assert _kimi_request_options("gpt-4.1-mini") == {}
     agent = ProtocolIIIAgent("kimi-k2.6", "http://127.0.0.1:9/v1", "test")
     assert agent.client.max_retries == 0
 
@@ -254,8 +248,8 @@ def test_large_dom_projection_is_bounded_relevant_and_bid_preserving() -> None:
         "truncated": False,
     }
     projected = _project_observation(result, "下载关键指标", unchanged=False)
-    encoded = json.dumps(projected, ensure_ascii=False)
-    assert len(encoded) <= 20_500
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    assert len(encoded.encode("utf-8")) <= 20_000
     assert projected["total_element_count"] == 1_001
     assert projected["elements_truncated_for_model"] is True
     assert any(item["bid"] == "target42" for item in projected["elements"])
@@ -263,7 +257,8 @@ def test_large_dom_projection_is_bounded_relevant_and_bid_preserving() -> None:
 
     repeated = _project_observation(result, "下载关键指标", unchanged=True)
     assert len(repeated["elements"]) <= 24
-    assert len(json.dumps(repeated, ensure_ascii=False)) <= 6_500
+    repeated_bytes = json.dumps(repeated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(repeated_bytes) <= 6_000
     assert repeated["bids_remain_valid"] is True
     assert any(item["bid"] == "target42" for item in repeated["elements"])
 
@@ -291,6 +286,185 @@ def test_relevant_body_flood_cannot_hide_visible_navigation_control() -> None:
     assert any(item["bid"] == "next" for item in projected["elements"])
 
 
+def test_projection_selects_by_priority_then_restores_dom_order() -> None:
+    elements = [
+        {"bid": "first", "tag": "p", "text": "intro", "visible": True},
+        {"bid": "target", "tag": "button", "text": "Download annual report", "visible": True},
+        {"bid": "last", "tag": "button", "text": "Continue", "visible": True},
+    ]
+    projected = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "reports",
+            "dom_hash": "a",
+            "evidence_id": "ev-1",
+            "elements": elements,
+            "truncated": False,
+        },
+        "download annual report",
+        unchanged=False,
+    )
+    assert [item["bid"] for item in projected["elements"]] == ["first", "target", "last"]
+
+
+def test_new_and_changed_elements_are_prioritized_with_bounded_context_and_scroll() -> None:
+    elements = [
+        {"bid": f"row{index}", "tag": "p", "text": "generic", "visible": True}
+        for index in range(200)
+    ]
+    elements.extend(
+        [
+            {
+                "bid": "new-option",
+                "tag": "button",
+                "role": "option",
+                "text": "Late choice",
+                "visible": True,
+                "new": True,
+                "context": ["listbox:Result choices", "section:Filters", "ignored"],
+            },
+            {
+                "bid": "spa-result",
+                "tag": "p",
+                "text": "Loaded later",
+                "visible": True,
+                "changed": True,
+            },
+        ]
+    )
+    result = {
+        "url": "https://example.test",
+        "title": "dynamic",
+        "dom_hash": "a",
+        "evidence_id": "ev-1",
+        "elements": elements,
+        "scroll": [
+            {
+                "kind": "page",
+                "frame": 0,
+                "frame_url": "https://example.test",
+                "top": True,
+                "bottom": False,
+                "position": 0,
+                "remaining": 900,
+                "viewport": 700,
+                "extent": 1600,
+            },
+            {
+                "kind": "container",
+                "frame": 0,
+                "bid": "list",
+                "role": "listbox",
+                "label": "Result choices",
+                "top": False,
+                "bottom": True,
+                "position": 400,
+                "remaining": 0,
+                "viewport": 100,
+                "extent": 500,
+            },
+        ],
+        "truncated": False,
+    }
+    projected = _project_observation(result, "unrelated task", unchanged=False, max_elements=12)
+    by_bid = {item["bid"]: item for item in projected["elements"]}
+    assert {"new-option", "spa-result"} <= set(by_bid)
+    assert by_bid["new-option"]["context"] == ["listbox:Result choices", "section:Filters"]
+    assert projected["scroll"][0]["top"] is True
+    assert projected["scroll"][1]["bottom"] is True
+    assert len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 20_000
+
+
+def test_scroll_metadata_cannot_break_repeated_projection_budget_or_hide_button() -> None:
+    scroll = [
+        {
+            "kind": "page",
+            "frame": 0,
+            "frame_url": "https://example.test/" + ("路径" * 200),
+            "top": True,
+            "bottom": False,
+            "position": 0,
+            "remaining": 5_000,
+            "viewport": 700,
+            "extent": 5_700,
+        }
+    ]
+    scroll.extend(
+        {
+            "kind": "container",
+            "frame": 0,
+            "frame_url": "https://example.test/" + ("路径" * 200),
+            "bid": f"scroll{index}",
+            "role": "listbox",
+            "label": "选项" * 120,
+            "visible": True,
+            "top": True,
+            "bottom": False,
+            "position": 0,
+            "remaining": 900,
+            "viewport": 100,
+            "extent": 1_000,
+        }
+        for index in range(20)
+    )
+    projected = _project_observation(
+        {
+            "url": "https://example.test/" + ("查询" * 20_000),
+            "title": "标题" * 20_000,
+            "dom_hash": "a",
+            "evidence_id": "ev-1",
+            "elements": [
+                {"bid": "go", "tag": "button", "text": "Continue", "visible": True},
+                *[
+                    {
+                        "frame": index + 1,
+                        "frame_error": "错误" * 200,
+                        "url": "https://example.test/" + ("路径" * 2_000),
+                    }
+                    for index in range(5)
+                ],
+            ],
+            "scroll": scroll,
+            "truncated": False,
+        },
+        "continue",
+        unchanged=True,
+    )
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 6_000
+    assert projected["elements"][0]["bid"] == "go"
+    assert projected["scroll"][0]["kind"] == "page"
+    assert projected["scroll_truncated_for_model"] is True
+
+    small = _project_observation(
+        {
+            "url": "https://example.test/" + ("查询" * 20_000),
+            "title": "标题" * 20_000,
+            "dom_hash": "a",
+            "evidence_id": "ev-1",
+            "elements": [
+                {"bid": "go", "tag": "button", "text": "Continue", "visible": True},
+                *[
+                    {
+                        "frame": index + 1,
+                        "frame_error": "错误" * 200,
+                        "url": "https://example.test/" + ("路径" * 2_000),
+                    }
+                    for index in range(5)
+                ],
+            ],
+            "scroll": scroll,
+            "truncated": False,
+        },
+        "continue",
+        unchanged=False,
+        max_chars=1_200,
+    )
+    assert len(json.dumps(small, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1_200
+    assert small["elements"][0]["bid"] == "go"
+    assert small["frame_errors_truncated_for_model"] is True
+
+
 def test_large_select_does_not_empty_repeated_observation() -> None:
     options = [
         {"value": "v" * 300, "label": "label" * 100, "selected": False}
@@ -316,6 +490,30 @@ def test_large_select_does_not_empty_repeated_observation() -> None:
     projected = _project_observation(result, "critical choice", unchanged=True)
     assert {item["bid"] for item in projected["elements"]} == {"select1", "button1"}
     assert len(json.dumps(projected, ensure_ascii=False)) <= 6_500
+
+
+def test_select_without_option_budget_keeps_truncation_marker() -> None:
+    options = [{"value": "v" * 300, "label": "选项" * 100, "selected": False} for _ in range(40)]
+    result = {
+        "url": "https://example.test",
+        "title": "selects",
+        "dom_hash": "a",
+        "evidence_id": "ev-1",
+        "elements": [
+            {"bid": "select1", "tag": "select", "visible": True, "options": options},
+            {"bid": "select2", "tag": "select", "visible": True, "options": options},
+            *[
+                {"bid": f"button{index}", "tag": "button", "text": f"Action {index}", "visible": True}
+                for index in range(5)
+            ],
+        ],
+        "truncated": False,
+    }
+    projected = _project_observation(result, "action", unchanged=False, max_chars=1_200)
+    selects = [item for item in projected["elements"] if item["tag"] == "select"]
+    assert len(selects) == 2
+    assert all(item.get("options") or item.get("options_truncated") is True for item in selects)
+    assert len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1_200
 
 
 def test_repeated_observation_filter_keeps_last_changed_bid_catalog() -> None:

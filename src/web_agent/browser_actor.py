@@ -107,6 +107,7 @@ _VOLATILE_TEXT = re.compile(
 _MARK_AND_COLLECT = r"""
 ({frameIndex, maxElements}) => {
   const output = [];
+  const scroll = [];
   const seen = new Set();
   const interactive = new Set([
     'A','BUTTON','INPUT','SELECT','TEXTAREA','OPTION','SUMMARY','DETAILS',
@@ -116,6 +117,82 @@ _MARK_AND_COLLECT = r"""
     'H1','H2','H3','H4','H5','H6','P','LI','DT','DD','TH','TD','TR','TABLE',
     'LABEL','IMG','CANVAS','SVG','PRE','CODE','BLOCKQUOTE','ARTICLE','SECTION'
   ]);
+  const contextTags = new Set([
+    'ARTICLE','ASIDE','DIALOG','FIELDSET','FIGURE','FOOTER','FORM','HEADER','LI',
+    'MAIN','NAV','SECTION','TD','TH','TR'
+  ]);
+  const contextRoles = new Set([
+    'alertdialog','dialog','form','group','list','listbox','main','menu','navigation',
+    'region','row','search','table'
+  ]);
+  const compactText = (value, limit) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  function parentOf(el) {
+    if (el.parentElement) return el.parentElement;
+    const root = el.getRootNode && el.getRootNode();
+    return root && root.host ? root.host : null;
+  }
+  function isHidden(el) {
+    let current = el;
+    while (current) {
+      const style = getComputedStyle(current);
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true' ||
+          style.display === 'none' || style.visibility === 'hidden') return true;
+      current = parentOf(current);
+    }
+    return false;
+  }
+  function parentContext(el) {
+    const result = [];
+    let parent = parentOf(el);
+    while (parent && result.length < 2) {
+      const tag = parent.tagName || '';
+      const role = (parent.getAttribute && parent.getAttribute('role')) || '';
+      if (contextTags.has(tag) || contextRoles.has(role)) {
+        let label = parent.getAttribute('aria-label') || parent.getAttribute('title') || '';
+        if (!label && parent.children) {
+          const descriptor = Array.from(parent.children).find(child =>
+            child.tagName === 'LEGEND' || /^H[1-6]$/.test(child.tagName)
+          );
+          if (descriptor) label = descriptor.textContent || '';
+        }
+        if (!label && ['LI','TD','TH','TR'].includes(tag)) {
+          label = Array.from(parent.childNodes)
+            .filter(node => node.nodeType === Node.TEXT_NODE)
+            .map(node => node.textContent || '').join(' ');
+        }
+        const kind = role || tag.toLowerCase();
+        const compactLabel = compactText(label, 120);
+        result.push(compactLabel ? `${kind}:${compactLabel}` : kind);
+      }
+      parent = parentOf(parent);
+    }
+    return result;
+  }
+  function scrollState(kind, el) {
+    const position = Math.max(0, Math.round(el.scrollTop || 0));
+    const viewport = Math.max(0, Math.round(kind === 'page' ? window.innerHeight : el.clientHeight));
+    const extent = Math.max(viewport, Math.round(el.scrollHeight || 0));
+    const remaining = Math.max(0, extent - viewport - position);
+    const state = {
+      kind, frame: frameIndex, top: position <= 1, bottom: remaining <= 1,
+      position, remaining, viewport, extent,
+    };
+    if (kind === 'container') {
+      state.bid = el.getAttribute('bid') || '';
+      state.tag = el.tagName.toLowerCase();
+      state.role = el.getAttribute('role') || '';
+      state.label = compactText(
+        el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('name') || '',
+        120,
+      );
+      const rect = el.getBoundingClientRect();
+      state.visible = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+        rect.top < window.innerHeight && rect.left < window.innerWidth;
+    }
+    return state;
+  }
+  const pageScroller = document.scrollingElement || document.documentElement;
+  scroll.push(scrollState('page', pageScroller));
   function walk(root) {
     if (!root || output.length >= maxElements) return;
     const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
@@ -123,7 +200,6 @@ _MARK_AND_COLLECT = r"""
       if (output.length >= maxElements) break;
       if (seen.has(el)) continue;
       seen.add(el);
-      if (el.shadowRoot) walk(el.shadowRoot);
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
       const role = el.getAttribute('role') || '';
@@ -131,9 +207,17 @@ _MARK_AND_COLLECT = r"""
       const meaningful = interactive.has(el.tagName) || semantic.has(el.tagName) ||
         Boolean(role) || el.tabIndex >= 0 || el.isContentEditable ||
         (hasText && el.children.length === 0);
-      if (!meaningful || style.display === 'none' || style.visibility === 'hidden') continue;
+      if (isHidden(el)) continue;
       const bid = el.getAttribute('bid');
       if (!bid) continue;
+      if (scroll.length < 21 && el.scrollHeight > el.clientHeight + 1 &&
+          ['auto','scroll'].includes(style.overflowY)) {
+        scroll.push(scrollState('container', el));
+      }
+      if (!meaningful) {
+        if (el.shadowRoot) walk(el.shadowRoot);
+        continue;
+      }
       const label = el.getAttribute('aria-label') ||
         (el.labels && el.labels.length ? Array.from(el.labels).map(x => x.innerText).join(' ') : '') ||
         el.getAttribute('alt') || el.getAttribute('title') || '';
@@ -144,8 +228,10 @@ _MARK_AND_COLLECT = r"""
         text, value: 'value' in el ? (el.type === 'password' ? '[REDACTED]' : String(el.value || '')) : '',
         checked: 'checked' in el ? Boolean(el.checked) : null,
         selected: 'selected' in el ? Boolean(el.selected) : null,
+        expanded: el.hasAttribute('aria-expanded') ? el.getAttribute('aria-expanded') === 'true' : null,
         disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
         href: el.href || '', type: el.type || '', name: el.name || '',
+        context: parentContext(el),
         rect: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
         visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
           rect.top < window.innerHeight && rect.left < window.innerWidth,
@@ -157,12 +243,62 @@ _MARK_AND_COLLECT = r"""
         }));
       }
       output.push(item);
+      if (el.shadowRoot) walk(el.shadowRoot);
     }
   }
   walk(document);
-  return {elements: output, truncated: output.length >= maxElements};
+  return {
+    documentId: String(performance.timeOrigin),
+    elements: output,
+    scroll,
+    truncated: output.length >= maxElements,
+  };
 }
 """
+
+
+_OBSERVATION_CHANGE_FIELDS = (
+    "tag",
+    "role",
+    "label",
+    "text",
+    "value",
+    "checked",
+    "selected",
+    "expanded",
+    "disabled",
+    "href",
+    "type",
+    "name",
+    "options",
+    "context",
+)
+
+
+def _observation_element_identity(element: dict[str, Any]) -> str:
+    return "|".join(
+        (
+            str(element.get("document_id") or element.get("frame_url", "")),
+            str(element.get("bid", "")),
+        )
+    )
+
+
+def _observation_element_signature(element: dict[str, Any]) -> str:
+    projected = {
+        key: element[key]
+        for key in _OBSERVATION_CHANGE_FIELDS
+        if element.get(key) not in (None, "", [], {})
+    }
+    return hashlib.sha256(
+        json.dumps(
+            projected,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
 
 
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -363,6 +499,9 @@ class BrowserActor:
         self._last_capture_semantic: str | None = None
         self._last_capture_path: str | None = None
         self._last_observation_semantic: str | None = None
+        self._last_observation_scope: str | None = None
+        self._last_observed_elements: dict[str, tuple[str, str]] = {}
+        self._frame_document_scopes: dict[str, str] = {}
         self._bind_evidence_store(self.evidence_store, self._generation)
 
     @property
@@ -791,6 +930,9 @@ class BrowserActor:
         self._last_capture_semantic = None
         self._last_capture_path = None
         self._last_observation_semantic = None
+        self._last_observation_scope = None
+        self._last_observed_elements = {}
+        self._frame_document_scopes = {}
         if self._playwright is None:
             return self._start_sync(initial_url)
         return self._prepare_task(initial_url)
@@ -1223,24 +1365,48 @@ class BrowserActor:
         )
         self._last_observation_semantic = str(current_state["semantic_page_fingerprint"])
         elements: list[dict[str, Any]] = []
+        scroll: list[dict[str, Any]] = []
+        document_scope: str | None = None
+        incomplete_document_scopes: set[str] = set()
         truncated = False
         browsergym_pre_extract(self._page, tags_to_mark="all", lenient=True)
         try:
             for frame_index, frame in enumerate(self._page.frames):
+                frame_key = str(getattr(getattr(frame, "_impl_obj", None), "_guid", id(frame)))
                 try:
                     result = frame.evaluate(
                         _MARK_AND_COLLECT,
                         {"frameIndex": frame_index, "maxElements": 4_000},
                     )
                 except Exception as exc:
+                    frame_url = sanitize_url(frame.url)
+                    cached_scope = self._frame_document_scopes.get(frame_key)
+                    if cached_scope:
+                        incomplete_document_scopes.add(cached_scope)
                     elements.append(
-                        {"frame": frame_index, "frame_error": _error_type(exc), "url": sanitize_url(frame.url)}
+                        {"frame": frame_index, "frame_error": _error_type(exc), "url": frame_url}
                     )
                     continue
-                truncated = truncated or bool(result["truncated"])
+                frame_url = sanitize_url(frame.url)
+                document_id = f"{frame_key}:{result.get('documentId') or frame_url}"
+                self._frame_document_scopes[frame_key] = document_id
+                if frame_index == 0:
+                    document_scope = document_id
+                if result["truncated"]:
+                    incomplete_document_scopes.add(document_id)
+                    truncated = True
                 for item in result["elements"]:
-                    item["frame_url"] = sanitize_url(frame.url)
+                    item["frame_url"] = frame_url
+                    item["document_id"] = document_id
+                for item in result.get("scroll", []):
+                    item["frame_url"] = frame_url
                 elements.extend(result["elements"])
+                scroll.extend(result.get("scroll", []))
+            self._annotate_observation_changes(
+                elements,
+                document_scope=document_scope or self._last_observation_scope or "unknown-document",
+                incomplete_document_scopes=incomplete_document_scopes,
+            )
             raw_snapshot, ax_tree = self._protocol_observation()
         finally:
             browsergym_post_extract(self._page)
@@ -1256,6 +1422,7 @@ class BrowserActor:
                     "dom_hash": dom_hash,
                     "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
                     "elements": elements,
+                    "scroll": scroll,
                     "elements_truncated": truncated,
                     "dom_snapshot": raw_snapshot,
                     "ax_tree": ax_tree,
@@ -1268,6 +1435,7 @@ class BrowserActor:
             "dom_hash": dom_hash,
             "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
             "elements": elements,
+            "scroll": scroll,
             "element_count": len(elements),
             "truncated": truncated,
             "artifact": str(artifact),
@@ -1283,10 +1451,41 @@ class BrowserActor:
             "dom_hash": dom_hash,
             "semantic_page_fingerprint": current_state["semantic_page_fingerprint"],
             "elements": elements,
+            "scroll": scroll,
             "truncated": truncated,
             "evidence_id": evidence.evidence_id,
             "screenshot_path": screenshot_path,
         }
+
+    def _annotate_observation_changes(
+        self,
+        elements: list[dict[str, Any]],
+        *,
+        document_scope: str,
+        incomplete_document_scopes: set[str] | None = None,
+    ) -> None:
+        compare = self._last_observation_scope == document_scope
+        current: dict[str, tuple[str, str]] = {}
+        for element in elements:
+            if not element.get("bid") or element.get("frame_error"):
+                continue
+            identity = _observation_element_identity(element)
+            signature = _observation_element_signature(element)
+            element_document_scope = str(element.get("document_id") or element.get("frame_url", ""))
+            current[identity] = (signature, element_document_scope)
+            if not compare:
+                continue
+            previous = self._last_observed_elements.get(identity)
+            if previous is None:
+                element["new"] = True
+            elif previous[0] != signature:
+                element["changed"] = True
+        if compare and incomplete_document_scopes:
+            for identity, previous in self._last_observed_elements.items():
+                if identity not in current and previous[1] in incomplete_document_scopes:
+                    current[identity] = previous
+        self._last_observation_scope = document_scope
+        self._last_observed_elements = current
 
     def _protocol_observation(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         try:
@@ -2095,6 +2294,22 @@ class BrowserActor:
             self._closed = True
             self._executor.shutdown(wait=False, cancel_futures=True)
 
+    async def retire(self) -> None:
+        """Drain prior calls and disconnect this actor without closing the external CDP browser."""
+        if self._closed:
+            return
+        completed = False
+        try:
+            await self._call(
+                self._retire_sync,
+                operation="retire",
+                allow_poisoned=True,
+            )
+            completed = True
+        finally:
+            self._closed = True
+            self._executor.shutdown(wait=completed, cancel_futures=True)
+
     async def flush_artifacts(self) -> None:
         await self._call(
             self._flush_artifacts_sync,
@@ -2119,6 +2334,25 @@ class BrowserActor:
         try:
             if self._browser:
                 self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._connected = False
+
+    def _retire_sync(self) -> None:
+        self._assert_thread()
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self._flush_artifacts_sync()
+        except Exception:
+            pass
+        try:
+            if self._page and not self._page.is_closed():
+                self._page.close(run_before_unload=False)
         except Exception:
             pass
         try:

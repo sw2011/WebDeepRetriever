@@ -186,6 +186,190 @@ def test_verifier_accepts_evidence_backed_scalar_answer() -> None:
     assert result.accepted is True
 
 
+def test_verifier_rejects_block_page_as_date_answer_and_requires_bound_date_evidence() -> None:
+    store = EvidenceStore()
+    blocked = store.add(
+        "dom",
+        "https://www.sec.gov/",
+        "SEC automation block page",
+        {"title": "Your Request Originates from an Undeclared Automated Tool"},
+    )
+    verifier = CompletionVerifier()
+    task = contract("查询 SEC EDGAR 数据库中，NVIDIA 公司首次提交 10-K 年报的日期")
+    blocked_answer = (
+        "SEC 网站阻止了自动化请求，因此无法通过当前方式获取该日期，"
+        "建议手动访问或使用官方 API。"
+    )
+    rejected = verifier.verify(
+        task,
+        blocked_answer,
+        [blocked.evidence_id],
+        {"$": [blocked.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://www.sec.gov/"],
+    )
+    assert rejected.accepted is False
+    assert any("要求日期值" in reason for reason in rejected.reasons)
+    assert any("仅证明访问受阻" in reason for reason in rejected.reasons)
+
+    claimed = verifier.verify(
+        task,
+        "1999-02-26",
+        [blocked.evidence_id],
+        {"$": [blocked.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://www.sec.gov/"],
+    )
+    assert claimed.accepted is False
+    assert any("未被对应绑定证据支持" in reason for reason in claimed.reasons)
+
+    filing = store.add(
+        "dom",
+        "https://www.sec.gov/filing",
+        "NVIDIA first 10-K filing",
+        {"filingDate": "1999-04-29 00:00:00"},
+    )
+    accepted = verifier.verify(
+        task,
+        "1999-04-29 00:00:00",
+        [filing.evidence_id],
+        {"$": [filing.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://www.sec.gov/filing"],
+    )
+    assert accepted.accepted is True
+
+    policy_footer = store.add(
+        "dom",
+        "https://www.sec.gov/filing-with-policy",
+        "NVIDIA filing page",
+        {
+            "filingDate": "1999-04-29",
+            "footer": "Automated access to our sites must comply with policy.",
+        },
+    )
+    policy_page_answer = verifier.verify(
+        task,
+        "1999-04-29",
+        [policy_footer.evidence_id],
+        {"$": [policy_footer.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://www.sec.gov/filing-with-policy"],
+    )
+    assert policy_page_answer.accepted is True
+
+    dated_block = store.add(
+        "dom",
+        "https://www.sec.gov/blocked",
+        "SEC block page updated 2026-08-04",
+        {"updated": "2026-08-04", "status": "automation request blocked"},
+    )
+    disguised = verifier.verify(
+        task,
+        "截至 2026-08-04，SEC 页面仍阻止请求，因此无法通过当前方式获取所问日期。",
+        [dated_block.evidence_id],
+        {"$": [dated_block.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://www.sec.gov/blocked"],
+    )
+    assert disguised.accepted is False
+    assert any("直接日期值" in reason for reason in disguised.reasons)
+    assert any("仅证明访问受阻" in reason for reason in disguised.reasons)
+
+
+def test_verifier_rejects_empty_structured_leaf_but_allows_access_status_answer() -> None:
+    store = EvidenceStore()
+    evidence = store.add("dom", "https://example.test", "status", {"status": "无法访问"})
+    verifier = CompletionVerifier()
+    empty_leaf = verifier.verify(
+        contract(),
+        {"name": "NVIDIA", "date": "   "},
+        [evidence.evidence_id],
+        {"$.name": [evidence.evidence_id], "$.date": [evidence.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://example.test"],
+    )
+    assert empty_leaf.accepted is False
+    assert "答案字段 $.date 为空" in empty_leaf.reasons
+
+    access_status = verifier.verify(
+        contract("判断该网站是否可以访问"),
+        "当前无法访问",
+        [evidence.evidence_id],
+        {"$": [evidence.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://example.test"],
+    )
+    assert access_status.accepted is True
+
+
+def test_verifier_does_not_treat_when_question_or_requested_negative_fact_as_non_answer() -> None:
+    store = EvidenceStore()
+    hours = store.add("dom", "https://example.test/hours", "hours", {"opens": "9:00 AM"})
+    verifier = CompletionVerifier()
+    time_answer = verifier.verify(
+        contract("When was customer support open?"),
+        "9:00 AM",
+        [hours.evidence_id],
+        {"$": [hours.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://example.test/hours"],
+    )
+    assert time_answer.accepted is True
+
+    limitation = store.add(
+        "dom",
+        "https://example.test/api",
+        "limitation",
+        {"value": "The API is unable to provide historical filings."},
+    )
+    negative_fact = verifier.verify(
+        contract("What is the API unable to provide?"),
+        "The API is unable to provide historical filings.",
+        [limitation.evidence_id],
+        {"$": [limitation.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://example.test/api"],
+    )
+    assert negative_fact.accepted is True
+
+    first_person = store.add(
+        "dom",
+        "https://example.test/policy",
+        "policy",
+        {"value": "We are unable to provide historical filings."},
+    )
+    first_person_fact = verifier.verify(
+        contract("What does the policy say the service is unable to provide?"),
+        "We are unable to provide historical filings.",
+        [first_person.evidence_id],
+        {"$": [first_person.evidence_id]},
+        None,
+        store,
+        [],
+        ["https://example.test/policy"],
+    )
+    assert first_person_fact.accepted is True
+
+
 def test_form_task_needs_positive_confirmation_receipt() -> None:
     store = EvidenceStore()
     evidence = store.add("dom", "https://example.test/done", "submitted", {"value": "ok"})

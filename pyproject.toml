@@ -44,4 +44,5 @@ addopts = "-ra"
 testpaths = ["tests"]
 markers = [
   "integration: requires a local Chrome process exposed through CDP",
+  "live: requires explicit opt-in and real model API credentials",
 ]

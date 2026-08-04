@@ -285,6 +285,7 @@ async def _worker_async(
         worker_id=config.worker_id,
     )
     summaries: list[dict[str, Any]] = []
+    actor_reset_required = False
     try:
         for item in items:
             task_started = time.monotonic()
@@ -303,6 +304,14 @@ async def _worker_async(
             task_dir.mkdir(parents=True, exist_ok=True)
             evidence_store = EvidenceStore()
             try:
+                if actor.poisoned or actor_reset_required:
+                    await actor.retire()
+                    actor = BrowserActor(
+                        config.cdp_url,
+                        output_root / f".worker-{config.worker_id}",
+                        EvidenceStore(),
+                    )
+                    actor_reset_required = False
                 await actor.begin_task(contract.website, task_dir, evidence_store)
                 run_result = await agent.run(
                     actor,
@@ -319,6 +328,7 @@ async def _worker_async(
                     ),
                 )
             except Exception as exc:
+                actor_reset_required = True
                 run_result = {
                     "status": "FAIL_BROWSER_ERROR",
                     "agent_answer": None,

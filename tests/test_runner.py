@@ -6,9 +6,11 @@ from queue import Empty
 import pytest
 
 from web_agent.runner import (
+    WorkerConfig,
     _aggregate_usage,
     _distribution,
     _kimi_tpm_budget,
+    _worker_async,
     atomic_write_json,
     is_completed,
     task_directory,
@@ -43,6 +45,161 @@ def test_result_resume_requires_verified_answer(tmp_path) -> None:
         {"status": "SUCCESS", "agent_answer": 0, "run_fingerprint": "fp", "run_id": "run-a"},
     )
     assert is_completed(directory, "fp", "run-a", manifest_valid=True) is True
+
+
+@pytest.mark.asyncio
+async def test_worker_replaces_poisoned_actor_at_next_task_boundary(tmp_path, monkeypatch) -> None:
+    actors = []
+
+    class FakeActor:
+        def __init__(self, cdp_url, output_dir, evidence_store) -> None:  # noqa: ANN001
+            self.poisoned = False
+            self.closed = False
+            self.started_tasks = []
+            self.retired = False
+            actors.append(self)
+
+        async def begin_task(self, website, output_dir, evidence_store) -> None:  # noqa: ANN001
+            assert self.poisoned is False
+            self.started_tasks.append(output_dir.name)
+
+        async def flush_artifacts(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def retire(self) -> None:
+            self.retired = True
+            self.closed = True
+
+    runs = []
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def run(self, actor, contract, evidence_store, progress_callback=None):  # noqa: ANN001
+            runs.append((contract.task_idx, actor))
+            if contract.task_idx == 1:
+                actor.poisoned = True
+                status, answer = "FAIL_BROWSER_POISONED", None
+            else:
+                status, answer = "SUCCESS", "second answer"
+            return {
+                "status": status,
+                "agent_answer": answer,
+                "evidence_ids": [],
+                "evidence_bindings": {},
+                "coverage": None,
+                "actions": [],
+                "thoughts": [],
+                "urls": [],
+                "receipts": [],
+                "predict_length": 0,
+                "model_usage": {},
+                "error": None,
+            }
+
+    monkeypatch.setattr("web_agent.runner.BrowserActor", FakeActor)
+    monkeypatch.setattr("web_agent.runner.ProtocolIIIAgent", FakeAgent)
+    config = WorkerConfig(
+        worker_id=0,
+        cdp_url="http://127.0.0.1:9222",
+        output_dir=str(tmp_path),
+        model="test-model",
+        api_base="http://127.0.0.1:9/v1",
+        api_key="not-used",
+        max_steps=10,
+        run_fingerprint="fp",
+        run_id="run",
+    )
+    items = [
+        {"task_idx": 1, "task_id": "first", "website": "https://first.test", "task": "first"},
+        {"task_idx": 2, "task_id": "second", "website": "https://second.test", "task": "second"},
+    ]
+
+    summaries = await _worker_async(config, items)
+
+    assert [item[0] for item in runs] == [1, 2]
+    assert len(actors) == 2
+    assert runs[0][1] is actors[0] and runs[1][1] is actors[1]
+    assert actors[0].started_tasks == ["1_first"]
+    assert actors[1].started_tasks == ["2_second"]
+    assert actors[0].retired is True
+    assert all(actor.closed for actor in actors)
+    assert [summary["status"] for summary in summaries] == ["FAIL_BROWSER_POISONED", "SUCCESS"]
+
+
+@pytest.mark.asyncio
+async def test_worker_replaces_actor_after_unpoisoned_initialization_failure(tmp_path, monkeypatch) -> None:
+    actors = []
+    runs = []
+
+    class FakeActor:
+        def __init__(self, cdp_url, output_dir, evidence_store) -> None:  # noqa: ANN001
+            self.poisoned = False
+            self.closed = False
+            actors.append(self)
+
+        async def begin_task(self, website, output_dir, evidence_store) -> None:  # noqa: ANN001
+            if self is actors[0]:
+                raise RuntimeError("initial CDP connection failed")
+
+        async def flush_artifacts(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def retire(self) -> None:
+            self.closed = True
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def run(self, actor, contract, evidence_store, progress_callback=None):  # noqa: ANN001
+            runs.append((contract.task_idx, actor))
+            return {
+                "status": "SUCCESS",
+                "agent_answer": "answer",
+                "evidence_ids": [],
+                "evidence_bindings": {},
+                "coverage": None,
+                "actions": [],
+                "thoughts": [],
+                "urls": [],
+                "receipts": [],
+                "predict_length": 0,
+                "model_usage": {},
+                "error": None,
+            }
+
+    monkeypatch.setattr("web_agent.runner.BrowserActor", FakeActor)
+    monkeypatch.setattr("web_agent.runner.ProtocolIIIAgent", FakeAgent)
+    config = WorkerConfig(
+        worker_id=0,
+        cdp_url="http://127.0.0.1:9222",
+        output_dir=str(tmp_path),
+        model="test-model",
+        api_base="http://127.0.0.1:9/v1",
+        api_key="not-used",
+        max_steps=10,
+        run_fingerprint="fp",
+        run_id="run",
+    )
+    items = [
+        {"task_idx": 1, "task_id": "first", "website": "https://first.test", "task": "first"},
+        {"task_idx": 2, "task_id": "second", "website": "https://second.test", "task": "second"},
+    ]
+
+    summaries = await _worker_async(config, items)
+
+    assert len(actors) == 2
+    assert runs == [(2, actors[1])]
+    assert all(actor.closed for actor in actors)
+    assert [summary["status"] for summary in summaries] == ["FAIL_BROWSER_ERROR", "SUCCESS"]
 
 
 def test_missing_or_corrupt_manifest_never_authorizes_resume(tmp_path) -> None:

@@ -295,6 +295,41 @@ def test_semantic_fingerprint_tracks_later_iframe_after_large_main_frame() -> No
     )
 
 
+def test_observation_change_tracking_uses_stable_bid_and_semantic_signature(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    baseline = [
+        {"bid": "10", "frame": 0, "frame_url": "https://example.test/app#/one", "document_id": "doc-1", "tag": "p", "text": "Waiting"},
+        {"bid": "11", "frame": 1, "frame_url": "https://example.test/frame", "document_id": "frame-doc", "tag": "button", "text": "Open"},
+    ]
+    actor._annotate_observation_changes(baseline, document_scope="doc-1")
+    assert not any(item.get("new") or item.get("changed") for item in baseline)
+
+    updated = [
+        {"bid": "10", "frame": 0, "frame_url": "https://example.test/app#/two", "document_id": "doc-1", "tag": "p", "text": "Ready"},
+        {"bid": "11", "frame": 2, "frame_url": "https://example.test/frame", "document_id": "frame-doc", "tag": "button", "text": "Open"},
+        {"bid": "12", "frame": 0, "frame_url": "https://example.test/app#/two", "document_id": "doc-1", "role": "option", "text": "Paris"},
+    ]
+    actor._annotate_observation_changes(updated, document_scope="doc-1")
+    assert updated[0]["changed"] is True
+    assert "changed" not in updated[1] and "new" not in updated[1]
+    assert updated[2]["new"] is True
+
+    partial = [updated[0]]
+    actor._annotate_observation_changes(
+        partial,
+        document_scope="doc-1",
+        incomplete_document_scopes={"frame-doc"},
+    )
+    recovered = [
+        {"bid": "10", "frame": 0, "frame_url": "https://example.test/app#/two", "document_id": "doc-1", "tag": "p", "text": "Ready"},
+        {"bid": "11", "frame": 5, "frame_url": "https://example.test/frame", "document_id": "frame-doc", "tag": "button", "text": "Open"},
+    ]
+    actor._annotate_observation_changes(recovered, document_scope="doc-1")
+    assert "new" not in recovered[1]
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_screenshot_failure_does_not_publish_broken_artifact(tmp_path) -> None:
     actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
 
@@ -940,6 +975,31 @@ async def test_outer_cancellation_after_dispatch_also_poisons_actor(tmp_path) ->
     release.set()
     tmp_path.mkdir(exist_ok=True)
     await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_retire_waits_for_late_poisoned_call_before_disconnecting(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_action() -> None:
+        started.set()
+        release.wait(timeout=1)
+
+    call = asyncio.create_task(actor._call(blocking_action, operation="click"))
+    assert await asyncio.to_thread(started.wait, 1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert actor.poisoned is True
+
+    retiring = asyncio.create_task(actor.retire())
+    await asyncio.sleep(0.02)
+    assert retiring.done() is False
+    release.set()
+    await asyncio.wait_for(retiring, timeout=1)
+    assert actor._closed is True
 
 
 @pytest.mark.asyncio

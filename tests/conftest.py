@@ -60,8 +60,12 @@ BASE_STYLE = """
 PAGES: dict[str, str] = {
     "/forms": f"""<!doctype html><html><head><title>Forms</title>{BASE_STYLE}</head><body>
       <h1>Form controls</h1>
-      <label for="primary">Contact</label><input id="primary" name="primary">
-      <label for="secondary">Contact</label><input id="secondary" name="secondary">
+      <section aria-label="Billing contact">
+        <label for="primary">Contact</label><input id="primary" name="primary">
+      </section>
+      <section aria-label="Shipping contact">
+        <label for="secondary">Contact</label><input id="secondary" name="secondary">
+      </section>
       <label for="country">Country</label>
       <select id="country" name="country">
         <option value="us">United States</option><option value="ca">Canada</option>
@@ -143,7 +147,7 @@ PAGES: dict[str, str] = {
         }}
         renderVirtual();
         virtual.addEventListener('scroll', renderVirtual);
-      </script>
+      </script><div style="height:1000px" aria-hidden="true"></div>
     </body></html>""",
     "/visual-tabs": f"""<!doctype html><html><head><title>Visual and tabs</title>{BASE_STYLE}</head><body>
       <h1>Visual and browser events</h1>

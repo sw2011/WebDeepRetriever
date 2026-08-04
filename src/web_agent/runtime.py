@@ -38,6 +38,7 @@ from .browser_actor import (
 )
 from .contracts import ActionReceipt, CoverageCertificate, TaskContract
 from .evidence import EvidenceStore
+from .model_profiles import build_model_settings, vision_request_options
 from .sanitization import redact_value, sanitize_exception, sanitize_url
 from .token_control import (
     MAX_SERIALIZED_CONTEXT_BYTES,
@@ -823,9 +824,12 @@ def _compact_element(element: dict[str, Any]) -> dict[str, Any]:
     href = element.get("href")
     if href:
         compact["href"] = sanitize_url(str(href))[:300]
-    for key in ("checked", "selected"):
+    for key in ("checked", "selected", "expanded"):
         if element.get(key) is not None:
             compact[key] = bool(element[key])
+    for key in ("new", "changed"):
+        if element.get(key) is True:
+            compact[key] = True
     if element.get("disabled"):
         compact["disabled"] = True
     if element.get("visible") is False:
@@ -839,6 +843,11 @@ def _compact_element(element: dict[str, Any]) -> dict[str, Any]:
     rect = element.get("rect")
     if _is_interactive(element) and isinstance(rect, list) and len(rect) == 4:
         compact["rect"] = rect
+    context = element.get("context")
+    if isinstance(context, list):
+        compact_context = [str(value)[:120] for value in context[:2] if value not in (None, "")]
+        if compact_context:
+            compact["context"] = compact_context
     options = element.get("options")
     if isinstance(options, list):
         compact["options"] = [
@@ -853,6 +862,57 @@ def _compact_element(element: dict[str, Any]) -> dict[str, Any]:
         if len(options) > 40:
             compact["options_truncated"] = True
     return compact
+
+
+def _truncate_utf8(value: Any, max_bytes: int) -> str:
+    encoded = str(value).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return str(value)
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _compact_scroll_states(value: Any, limit: int = 24) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    ranked = []
+    for index, state in enumerate(value):
+        if not isinstance(state, dict) or state.get("kind") not in {"page", "container"}:
+            continue
+        frame = state.get("frame") if isinstance(state.get("frame"), int) else 1_000_000
+        if state["kind"] == "page" and frame == 0:
+            priority = 0
+        elif state["kind"] == "container" and frame == 0 and state.get("visible") is True:
+            priority = 1
+        elif state["kind"] == "page":
+            priority = 2
+        elif state.get("visible") is True:
+            priority = 3
+        else:
+            priority = 4
+        ranked.append((priority, frame, index, state))
+    ranked.sort(key=lambda item: item[:3])
+    projected: list[dict[str, Any]] = []
+    for _, _, _, state in ranked:
+        if len(projected) >= limit:
+            break
+        compact: dict[str, Any] = {"kind": state["kind"]}
+        for key in ("frame", "position", "remaining", "viewport", "extent"):
+            if isinstance(state.get(key), (int, float)):
+                compact[key] = max(0, round(state[key]))
+        for key in ("top", "bottom"):
+            if isinstance(state.get(key), bool):
+                compact[key] = state[key]
+        for key, size in (("bid", 80), ("tag", 40), ("role", 80), ("label", 96)):
+            if state.get(key) not in (None, ""):
+                compact[key] = _truncate_utf8(state[key], size)
+        if state.get("frame_url"):
+            compact["frame_url"] = _truncate_utf8(sanitize_url(str(state["frame_url"])), 240)
+        projected.append(compact)
+    return projected
+
+
+def _serialized_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def _project_observation(
@@ -871,9 +931,13 @@ def _project_observation(
             if isinstance(element, dict) and element.get("frame_error"):
                 frame_errors.append(element)
             continue
+        context = element.get("context")
+        context_text = " ".join(str(value) for value in context) if isinstance(context, list) else ""
         searchable = " ".join(
-            str(element.get(key, "")).casefold()
-            for key in ("text", "label", "name", "role", "tag", "href")
+            [
+                *(str(element.get(key, "")).casefold() for key in ("text", "label", "name", "role", "tag", "href")),
+                context_text.casefold(),
+            ]
         )
         relevance = sum(1 for term in terms if term in searchable)
         interactive = _is_interactive(element)
@@ -886,11 +950,13 @@ def _project_observation(
             + int(visible) * 25
             + int(semantic) * 15
             + int(action_label) * 80
+            + int(element.get("new") is True) * 160
+            + int(element.get("changed") is True) * 120
         )
         if not (interactive or semantic or relevance or visible):
             continue
-        candidates.append((score, -index, element, interactive, visible))
-    candidates.sort(reverse=True, key=lambda value: (value[0], value[1]))
+        candidates.append((score, index, element, interactive, visible))
+    candidates.sort(key=lambda value: (-value[0], value[1]))
 
     element_limit = min(max_elements, 24) if unchanged else max_elements
     char_limit = min(max_chars, 6_000) if unchanged else max_chars
@@ -901,58 +967,135 @@ def _project_observation(
         *reserved,
         *(candidate for candidate in candidates if str(candidate[2].get("bid")) not in reserved_bids),
     ]
-    projected: list[dict[str, Any]] = []
+    projected: list[tuple[int, dict[str, Any]]] = []
+    compact_frame_errors = []
+    for error in frame_errors[:5]:
+        compact_error: dict[str, Any] = {}
+        if isinstance(error.get("frame"), int):
+            compact_error["frame"] = error["frame"]
+        if error.get("frame_error"):
+            compact_error["frame_error"] = _truncate_utf8(error["frame_error"], 80)
+        if error.get("url"):
+            compact_error["url"] = _truncate_utf8(sanitize_url(str(error["url"])), 240)
+        compact_frame_errors.append(compact_error)
+    raw_url = result.get("url")
+    url_limit = min(600, max(32, char_limit // 8))
+    title_limit = min(300, max(24, char_limit // 12))
+    identifier_limit = min(128, max(16, char_limit // 24))
     base = {
-        "url": result.get("url"),
-        "title": result.get("title"),
-        "dom_hash": result.get("dom_hash"),
-        "semantic_page_fingerprint": result.get("semantic_page_fingerprint"),
-        "evidence_id": result.get("evidence_id"),
+        "url": _truncate_utf8(sanitize_url(str(raw_url)), url_limit) if raw_url else raw_url,
+        "title": _truncate_utf8(result.get("title") or "", title_limit),
+        "dom_hash": _truncate_utf8(result.get("dom_hash") or "", identifier_limit) or None,
+        "semantic_page_fingerprint": _truncate_utf8(
+            result.get("semantic_page_fingerprint") or "", identifier_limit
+        ) or None,
+        "evidence_id": _truncate_utf8(result.get("evidence_id") or "", identifier_limit) or None,
         "unchanged": unchanged,
         "bids_remain_valid": unchanged,
         "total_element_count": len(result.get("elements", [])),
         "source_truncated": bool(result.get("truncated")),
-        "frame_errors": frame_errors[:5],
+        "frame_errors": [],
     }
-    for _, _, element, _, _ in ordered_candidates:
+    instruction = (
+        "DOM 未变化；以下 bid 已在本次观察中确认有效。不要继续重复 observe，按 bid 操作或用 extract 获取正文。"
+        if unchanged
+        else "这里只包含优先级最高的可见、可交互或任务相关元素；正文、列表和表格请用 extract 按需获取。"
+    )
+    if char_limit < 1_000:
+        instruction = "按有效 bid 操作；正文按需 extract。"
+
+    def render(
+        records: list[tuple[int, dict[str, Any]]],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        elements = [item for _, item in sorted(records, key=lambda record: record[0])]
+        return {
+            **(metadata or base),
+            "elements": elements,
+            "element_count": len(elements),
+            "elements_truncated_for_model": len(elements) < len(candidates),
+            "instruction": instruction,
+        }
+
+    element_reserve = min(1_000, char_limit // 5) if candidates else 0
+    selected_frame_errors: list[dict[str, Any]] = []
+    for error in compact_frame_errors:
+        candidate_errors = [*selected_frame_errors, error]
+        candidate_base = {**base, "frame_errors": candidate_errors}
+        if len(candidate_errors) < len(compact_frame_errors):
+            candidate_base["frame_errors_truncated_for_model"] = True
+        if _serialized_bytes(render([], candidate_base)) > char_limit - element_reserve:
+            continue
+        selected_frame_errors.append(error)
+    base["frame_errors"] = selected_frame_errors
+    if len(selected_frame_errors) < len(compact_frame_errors):
+        base["frame_errors_truncated_for_model"] = True
+
+    scroll_candidates = _compact_scroll_states(result.get("scroll"))
+    valid_scroll_count = sum(
+        1
+        for state in result.get("scroll", [])
+        if isinstance(state, dict) and state.get("kind") in {"page", "container"}
+    ) if isinstance(result.get("scroll"), list) else 0
+    scroll_budget = min(3_000, max(500, char_limit // 4))
+    scroll: list[dict[str, Any]] = []
+    for state in scroll_candidates:
+        candidate = [*scroll, state]
+        if _serialized_bytes(candidate) > scroll_budget:
+            continue
+        candidate_base = {**base, "scroll": candidate}
+        if len(candidate) < valid_scroll_count:
+            candidate_base["scroll_truncated_for_model"] = True
+        if _serialized_bytes(render([], candidate_base)) > char_limit - element_reserve:
+            continue
+        scroll.append(state)
+    if scroll:
+        base["scroll"] = scroll
+    if len(scroll) < valid_scroll_count:
+        base["scroll_truncated_for_model"] = True
+
+    deferred_options: dict[int, tuple[list[dict[str, Any]], bool]] = {}
+    for _, index, element, _, _ in ordered_candidates:
         if len(projected) >= element_limit:
             break
         compact = _compact_element(element)
         options = compact.get("options")
-        if isinstance(options, list):
-            low, high = 0, len(options)
-            while low < high:
-                middle = (low + high + 1) // 2
-                attempted = {
-                    **compact,
-                    "options": options[:middle],
-                    "options_truncated": middle < len(options) or compact.get("options_truncated", False),
-                }
-                candidate = {**base, "elements": [*projected, attempted]}
-                if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) <= char_limit:
-                    low = middle
-                else:
-                    high = middle - 1
-            compact["options"] = options[:low]
-            if low < len(options):
-                compact["options_truncated"] = True
-            if low == 0:
-                compact.pop("options", None)
-        candidate = {**base, "elements": [*projected, compact]}
-        if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) > char_limit:
+        if isinstance(options, list) and options:
+            deferred_options[index] = (options, bool(compact.get("options_truncated")))
+            compact.pop("options", None)
+            compact["options_truncated"] = True
+        candidate = [*projected, (index, compact)]
+        if _serialized_bytes(render(candidate)) > char_limit:
             continue
-        projected.append(compact)
-    return {
-        **base,
-        "elements": projected,
-        "element_count": len(projected),
-        "elements_truncated_for_model": len(projected) < len(candidates),
-        "instruction": (
-            "DOM 未变化；以下 bid 已在本次观察中确认有效。不要继续重复 observe，按 bid 操作或用 extract 获取正文。"
-            if unchanged
-            else "这里只包含优先级最高的可见、可交互或任务相关元素；正文、列表和表格请用 extract 按需获取。"
-        ),
-    }
+        projected.append((index, compact))
+
+    for record_index, (dom_index, compact) in enumerate(projected):
+        deferred = deferred_options.get(dom_index)
+        if deferred is None:
+            continue
+        options, source_truncated = deferred
+        low, high = 0, len(options)
+        while low < high:
+            middle = (low + high + 1) // 2
+            attempted = {
+                **compact,
+                "options": options[:middle],
+                "options_truncated": middle < len(options) or source_truncated,
+            }
+            candidate = [*projected]
+            candidate[record_index] = (dom_index, attempted)
+            if _serialized_bytes(render(candidate)) <= char_limit:
+                low = middle
+            else:
+                high = middle - 1
+        if low:
+            expanded = {**compact, "options": options[:low]}
+            if low < len(options) or source_truncated:
+                expanded["options_truncated"] = True
+            else:
+                expanded.pop("options_truncated", None)
+            projected[record_index] = (dom_index, expanded)
+    return render(projected)
 
 
 def _json(value: Any, limit: int = 140_000) -> str:
@@ -1644,7 +1787,7 @@ async def _vision_completion(
             model=context.vision_model,
             messages=messages,
             max_tokens=600,
-            **_kimi_request_options(context.vision_model),
+            **vision_request_options(context.vision_model),
         )
     except asyncio.CancelledError as exc:
         latency = (time.monotonic() - model_started) * 1_000
@@ -2310,22 +2453,7 @@ TOOLS = [
 
 
 def _model_settings(model: str) -> ModelSettings:
-    settings: dict[str, Any] = {
-        "tool_choice": "required",
-        "parallel_tool_calls": False,
-        "temperature": 0,
-    }
-    settings.update(_kimi_request_options(model))
-    return ModelSettings(**settings)
-
-
-def _kimi_request_options(model: str) -> dict[str, Any]:
-    if model.strip().lower().rsplit("/", 1)[-1] != "kimi-k2.6":
-        return {}
-    return {
-        "temperature": 0.6,
-        "extra_body": {"thinking": {"type": "disabled"}},
-    }
+    return build_model_settings(model)
 
 
 class ProtocolIIIAgent:

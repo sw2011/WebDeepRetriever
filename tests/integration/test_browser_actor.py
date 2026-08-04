@@ -69,6 +69,7 @@ async def test_large_dom_model_projection_repeat_and_full_audit(actor_factory: A
     assert first["total_element_count"] >= 1_200
     assert first["element_count"] <= 120
     assert len(first_text) <= 24_000
+    assert len(first_text.encode("utf-8")) <= 24_000
     critical = next(item for item in first["elements"] if item.get("text") == "Download critical metric")
 
     second_text = await observe_tool.on_invoke_tool(
@@ -106,6 +107,9 @@ async def test_native_custom_form_duplicate_labels_stale_bid_and_spa(
     assert len({element["bid"] for element in contact_inputs}) == 2
     primary = one_element(observation, tag="input", name="primary")
     secondary = one_element(observation, tag="input", name="secondary")
+    assert primary["context"] == ["section:Billing contact"]
+    assert secondary["context"] == ["section:Shipping contact"]
+    assert all(len(value) <= 128 for element in contact_inputs for value in element["context"])
     country = one_element(observation, tag="select", name="country")
     terms = one_element(observation, tag="input", name="terms")
     volatile = one_element(observation, tag="input", name="volatile")
@@ -122,8 +126,11 @@ async def test_native_custom_form_duplicate_labels_stale_bid_and_spa(
     trigger = one_element(observation, tag="button", text="Choose city")
     assert (await actor.click(trigger["bid"]))["success"]
     opened = await actor.observe()
-    assert one_element(opened, role="listbox", label="City choices")
+    listbox = one_element(opened, role="listbox", label="City choices")
+    assert listbox["new"] is True
     paris = one_element(opened, role="option", text="Paris")
+    assert paris["new"] is True
+    assert paris["context"] == ["listbox:City choices"]
     assert (await actor.click(paris["bid"]))["success"]
     assert "City: Paris" in (await actor.extract("text"))["data"]
 
@@ -136,13 +143,14 @@ async def test_native_custom_form_duplicate_labels_stale_bid_and_spa(
     refreshed = await actor.observe()
     new_volatile = one_element(refreshed, tag="input", name="volatile")
     assert new_volatile["bid"] != volatile["bid"]
+    assert new_volatile["new"] is True
     assert (await actor.fill(new_volatile["bid"], "fresh-value"))["success"]
 
     delayed = one_element(refreshed, tag="button", text="Load delayed state")
     assert (await actor.click(delayed["bid"]))["success"]
     await actor.wait(700)
     delayed_observation = await actor.observe()
-    assert one_element(delayed_observation, text="SPA ready")
+    assert one_element(delayed_observation, text="SPA ready")["changed"] is True
 
 
 async def test_nested_iframe_and_open_shadow_dom(actor_factory: Any) -> None:
@@ -178,6 +186,12 @@ async def test_pagination_and_virtual_list_exhaustion(actor_factory: Any) -> Non
 
     for page_number in range(1, 4):
         observation = await actor.observe()
+        page_scroll = next(
+            state for state in observation["scroll"] if state["kind"] == "page" and state["frame"] == 0
+        )
+        assert page_scroll["top"] is True
+        assert page_scroll["bottom"] is False
+        assert page_scroll["remaining"] > 0
         page_items = {
             element["text"]
             for element in observation["elements"]
@@ -208,6 +222,15 @@ async def test_pagination_and_virtual_list_exhaustion(actor_factory: Any) -> Non
             if element.get("role") == "listitem" and element.get("text", "").startswith("Virtual item"):
                 bid_history.setdefault(element["bid"], set()).add(element["text"])
         virtual = one_element(observation, role="list", label="Virtual products")
+        virtual_scroll = next(
+            state
+            for state in observation["scroll"]
+            if state["kind"] == "container" and state.get("bid") == virtual["bid"]
+        )
+        if not all_virtual - current:
+            assert virtual_scroll["top"] is True
+            assert virtual_scroll["bottom"] is False
+            assert virtual_scroll["remaining"] > 0
         if len(all_virtual) == 15:
             before_terminal_scroll = len(all_virtual)
             await actor.scroll(4_000, virtual["bid"])
@@ -221,6 +244,13 @@ async def test_pagination_and_virtual_list_exhaustion(actor_factory: Any) -> Non
             }
             assert len(all_virtual | terminal_items) == before_terminal_scroll
             assert one_element(terminal, text="End of virtual list")
+            terminal_scroll = next(
+                state
+                for state in terminal["scroll"]
+                if state["kind"] == "container" and state.get("bid") == virtual["bid"]
+            )
+            assert terminal_scroll["bottom"] is True
+            assert terminal_scroll["remaining"] == 0
             break
         assert len(all_virtual) > previous_count
         previous_count = len(all_virtual)
@@ -230,6 +260,14 @@ async def test_pagination_and_virtual_list_exhaustion(actor_factory: Any) -> Non
         await actor.wait(100)
     assert all_virtual == {f"Virtual item {number}" for number in range(1, 16)}
     assert any(len(texts) > 1 for texts in bid_history.values()), "fixture must recycle DOM rows"
+    assert (await actor.scroll(10_000))["success"] is True
+    page_bottom = await actor.observe()
+    page_scroll = next(
+        state for state in page_bottom["scroll"] if state["kind"] == "page" and state["frame"] == 0
+    )
+    assert page_scroll["top"] is False
+    assert page_scroll["bottom"] is True
+    assert page_scroll["remaining"] == 0
 
 
 async def test_canvas_image_dialog_and_new_tab(actor_factory: Any) -> None:
@@ -434,6 +472,17 @@ async def test_cdp_disconnect_fails_fast_without_success_receipt(actor_factory: 
         await actor.fill(field["bid"], "must-not-succeed")
     elapsed = time.monotonic() - started
     assert elapsed < 2
+
+
+async def test_retired_poisoned_actor_can_reconnect_to_same_real_cdp(actor_factory: Any) -> None:
+    first: BrowserActor = await actor_factory("/thread")
+    first._mark_poisoned(first.task_generation, "ACTOR_POISONED: test retirement")
+    await first.retire()
+
+    second: BrowserActor = await actor_factory("/forms")
+    observation = await second.observe()
+    assert observation["url"].endswith("/forms")
+    assert observation["elements"]
 
 
 async def test_volatile_clock_changes_raw_hash_but_not_semantic_state(actor_factory: Any) -> None:
