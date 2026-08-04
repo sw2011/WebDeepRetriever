@@ -1,6 +1,6 @@
 # 验收记录
 
-记录日期：2026-07-26（Asia/Shanghai）。本文件只记录本工作区实际执行过的命令与结果。
+记录日期：2026-08-03（Asia/Shanghai）。本文件只记录本工作区实际执行过的命令与结果。
 
 ## 环境
 
@@ -22,9 +22,10 @@
 WEB_AGENT_REQUIRE_CHROME=1 .venv/bin/pytest -q
 ```
 
-实际结果：`40 passed in 34.17s`。其中 8 个集成用例通过 Playwright
-`connect_over_cdp()` 连接临时 Chrome，未使用裸 CDP 客户端；其余 32 个用例覆盖验证器、
-非法工具 Schema、100 步硬限制、未验证 finish、证据脱敏、进程/线程隔离和评测入口。
+实际结果：`207 passed in 45.07s`。其中 11 个集成用例通过 Playwright
+`connect_over_cdp()` 连接临时 Chrome，未使用裸 CDP 客户端；其余 196 个用例覆盖契约、
+验证器、运行指纹与安全续跑、真实 preflight、动作 deadline/迟到隔离、Worker watchdog、
+证据脱敏、进程/线程隔离和评测入口。
 
 单独运行非浏览器用例：
 
@@ -32,27 +33,27 @@ WEB_AGENT_REQUIRE_CHROME=1 .venv/bin/pytest -q
 .venv/bin/pytest -q -m 'not integration'
 ```
 
-实际结果：`32 passed, 8 deselected in 0.67s`。
+实际结果：`196 passed, 11 deselected in 4.37s`。
 
 ## 构建与静态自检
 
 ```bash
+.venv/bin/python -m compileall -q src tests
 node --check vendor/browsergym/src/browsergym/core/javascript/frame_mark_elements.js
 node --check vendor/browsergym/src/browsergym/core/javascript/frame_unmark_elements.js
-uv build --wheel --out-dir /tmp/webdeepretriever-wheel-final
-.venv/bin/python -m web_agent.cli --healthcheck
+uv build --wheel --out-dir /tmp/webretriever-wheel-final-20260803 .
+.venv/bin/python -m web_agent.cli --help
+.venv/bin/python -m web_agent.cli \
+  --preflight --output /tmp/webretriever-preflight-smoke-final
 ```
 
-实际结果：两份 JavaScript 语法通过；wheel 构建成功；wheel 内包含 vendored
-BrowserGym 源码、两份 JavaScript、上游 LICENSE、SOURCE 和 THIRD_PARTY_NOTICES；健康检查输出：
+Python、两份 JavaScript 语法、CLI help 和 wheel 构建均通过。无 CDP URL 的失败烟测返回退出码 2
+及稳定错误码 `PREFLIGHT_CDP_WORKER_COUNT`，同时落盘审计结果并保持 `model_requests: 0`、
+`target_navigation: false`；真实 CDP 能力由上面的 Chrome 集成测试覆盖。
 
-```json
-{"status": "ok", "playwright_transport": "cdp", "max_workers": 8}
-```
-
-另在 `/tmp` 新建干净 Python 3.13 venv 安装该 wheel；健康检查通过，安装后的
-`browsergym.core.observation` 可读取 12,478 字节的 marker JavaScript，且
-`get_elem_by_bid` 来自 vendored `browsergym.core.action.utils`。
+另在 `/tmp` 新建干净 Python 3.12 venv 安装该 wheel；安装态 `web_agent` 与 vendored
+`browsergym` 均可导入，运行源码哈希非空；修改临时安装态 BrowserGym JavaScript 后哈希随之变化，
+确认 wheel 安装场景不会退化为空源码哈希。
 
 当前主机没有 `docker` 命令，因此未声称 Docker 镜像或 Compose 已实际构建。Dockerfile 已提供
 非 root 用户、外部 CDP 约束、健康检查和扫描 PDF 所需的 `poppler-utils`，应在具备 Docker 的

@@ -49,6 +49,8 @@ class ActionReceipt:
     error: str | None = None
     stale_bid: bool = False
     created_at: str = field(default_factory=utc_now)
+    task_generation: int = 0
+    attempt: int = 0
 
     @property
     def changed(self) -> bool:
@@ -69,6 +71,8 @@ class ActionReceipt:
             "error": sanitize_error_text(self.error) if self.error else None,
             "stale_bid": self.stale_bid,
             "created_at": self.created_at,
+            "task_generation": self.task_generation,
+            "attempt": self.attempt,
         }
 
 
@@ -123,15 +127,9 @@ class CoverageCertificate:
 
 
 _COVERAGE_PATTERNS = re.compile(
-    r"(?:全部|所有|完整|列出|分别|每(?:个|项)|全[部量]|top\s*(?!\d+\s*%)\d+|前\s*(?:\d+|[一二三四五六七八九十]+)(?:个|项)?|哪\s*(?:\d+|[一二三四五六七八九十]+)\s*个|排名|共有多少|总数|哪些|\bhow\s+many\b|\bwhich\b[^?.]{0,80}\b(?:are|were|have|contain|include)\b|\blist\s+all\b|\btotal\s+number\b|\bevery\b)",
+    r"(?:全部|所有(?!权|者|制)|完整\s*(?:列表|名单|清单|记录|结果|条目|数据集)|列出|每(?:个|项)|全[部量]|top\s*(?!\d+\s*%)\d+|前\s*(?:\d+|[一二三四五六七八九十]+)(?:个|项)?|哪\s*(?:\d+|[一二三四五六七八九十]+)\s*个|(?<!第)几(?:个|项)\s*(?:重点)?(?:事件|名称|记录|结果|条目)|共有多少|总数|哪些|\bhow\s+many\b|\bwhich\b[^?.]{0,80}\b(?:are|were|have|contain|include)\b|\blist\s+all\b|\btotal\s+number\b|\bevery\b)",
     re.IGNORECASE,
 )
-_FORM_PATTERNS = re.compile(
-    r"(?:提交|申请|预约|注册|登录|下单|购买|发送|发布|保存|创建|上传|确认表单)",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class TaskContract:
     task_idx: int | str
@@ -146,6 +144,9 @@ class TaskContract:
     def from_item(cls, item: dict[str, Any], max_steps: int = 100) -> TaskContract:
         task = str(item.get("task", "")).strip()
         website = str(item.get("website", "")).strip()
+        form_confirmation = item.get("requires_form_confirmation", False)
+        if not isinstance(form_confirmation, bool):
+            raise ValueError("requires_form_confirmation 必须是 JSON 布尔值 true/false")
         if website and not website.startswith(("http://", "https://")):
             website = "https://" + website
         return cls(
@@ -154,6 +155,6 @@ class TaskContract:
             website=website,
             task=task,
             requires_coverage=bool(_COVERAGE_PATTERNS.search(task)),
-            requires_form_confirmation=bool(_FORM_PATTERNS.search(task)),
+            requires_form_confirmation=form_confirmation,
             max_steps=min(max(int(max_steps), 1), 100),
         )

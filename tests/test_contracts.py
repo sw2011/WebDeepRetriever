@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -9,9 +11,15 @@ from web_agent.evidence import EvidenceStore
 from web_agent.verifier import CompletionVerifier
 
 
-def contract(task: str = "查询页面中的值") -> TaskContract:
+def contract(task: str = "查询页面中的值", *, requires_form_confirmation: bool = False) -> TaskContract:
     return TaskContract.from_item(
-        {"task_idx": 1, "task_id": "task-1", "website": "https://example.test", "task": task}
+        {
+            "task_idx": 1,
+            "task_id": "task-1",
+            "website": "https://example.test",
+            "task": task,
+            "requires_form_confirmation": requires_form_confirmation,
+        }
     )
 
 
@@ -28,13 +36,14 @@ def successful_receipt(confirmation: bool = False) -> ActionReceipt:
     )
 
 
-def test_contract_caps_protocol_steps_and_infers_obligations() -> None:
+def test_contract_caps_protocol_steps_and_infers_coverage_only() -> None:
     value = TaskContract.from_item(
         {
             "task_idx": 3,
             "task_id": "x",
             "website": "example.test",
             "task": "列出所有记录并提交申请",
+            "requires_form_confirmation": True,
         },
         max_steps=999,
     )
@@ -51,6 +60,79 @@ def test_contract_caps_protocol_steps_and_infers_obligations() -> None:
     assert contract("Which year had the highest revenue?").requires_coverage is False
     assert contract("Which companies are included in the index?").requires_coverage is True
     assert contract("Indicator=Top 10% income share, Year=2010; what is the value (%)?").requires_coverage is False
+    assert contract("北京和上海的人口分别是多少？").requires_coverage is False
+    assert contract("查询公司的所有权结构").requires_coverage is False
+    assert contract("查询公司的完整名称").requires_coverage is False
+    assert contract("查询该大学的世界排名").requires_coverage is False
+    assert contract("查询公司的完整信息").requires_coverage is False
+    assert contract("查询软件的完整版本号").requires_coverage is False
+    assert contract("查询页面的完整 URL").requires_coverage is False
+    assert contract("查询该企业的所有制性质").requires_coverage is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (None, False),
+    ],
+)
+def test_form_confirmation_requires_explicit_boolean_true(value: object, expected: bool) -> None:
+    item = {
+        "task_idx": 1,
+        "task_id": "form",
+        "website": "example.test",
+        "task": "填写并提交申请",
+    }
+    if value is not None:
+        item["requires_form_confirmation"] = value
+    assert TaskContract.from_item(item).requires_form_confirmation is expected
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None])
+def test_invalid_explicit_form_confirmation_type_is_rejected(value: object) -> None:
+    with pytest.raises(ValueError, match="JSON 布尔值"):
+        TaskContract.from_item(
+            {
+                "task_idx": 1,
+                "task_id": "form",
+                "website": "example.test",
+                "task": "填写并提交申请",
+                "requires_form_confirmation": value,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "查询公司首次提交 10-K 年报的日期",
+        "查询专利申请号对应的申请日期",
+        "查找机构发布的年度报告",
+        "检索已发送公告的发布时间",
+    ],
+)
+def test_retrieval_wording_never_implies_form_side_effect(task: str) -> None:
+    assert contract(task).requires_form_confirmation is False
+
+
+def test_fixed_sample_task_37_is_retrieval_not_form_submission() -> None:
+    dataset_path = Path(__file__).resolve().parents[1] / "evaluation" / "protocol3_sample_8.json"
+    items = json.loads(dataset_path.read_text(encoding="utf-8"))
+    item = next(value for value in items if value["task_idx"] == 37)
+    value = TaskContract.from_item(item)
+    assert value.requires_form_confirmation is False
+    assert value.requires_coverage is False
+
+
+def test_fixed_sample_task_25_requires_collection_coverage() -> None:
+    dataset_path = Path(__file__).resolve().parents[1] / "evaluation" / "protocol3_sample_8.json"
+    items = json.loads(dataset_path.read_text(encoding="utf-8"))
+    item = next(value for value in items if value["task_idx"] == 25)
+    value = TaskContract.from_item(item)
+    assert value.requires_coverage is True
+    assert contract("查询排名第几个").requires_coverage is False
 
 
 def test_verifier_rejects_empty_unknown_and_unvisited_evidence() -> None:
@@ -109,7 +191,7 @@ def test_form_task_needs_positive_confirmation_receipt() -> None:
     evidence = store.add("dom", "https://example.test/done", "submitted", {"value": "ok"})
     verifier = CompletionVerifier()
     args = (
-        contract("填写并提交申请"),
+        contract("填写并提交申请", requires_form_confirmation=True),
         "提交成功",
         [evidence.evidence_id],
         {"$": [evidence.evidence_id]},

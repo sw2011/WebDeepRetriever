@@ -12,9 +12,10 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from pypdf import PdfReader
 
@@ -35,6 +36,61 @@ from browsergym.core.observation import (  # noqa: E402
 )
 
 T = TypeVar("T")
+
+
+class BrowserActorPoisonedError(RuntimeError):
+    pass
+
+
+class ActorCallDeadlineExceeded(TimeoutError):
+    def __init__(
+        self,
+        operation: str,
+        *,
+        dispatched: bool,
+        task_generation: int = 0,
+        attempt: int = 0,
+    ) -> None:
+        self.operation = operation
+        self.dispatched = dispatched
+        self.task_generation = task_generation
+        self.attempt = attempt
+        state = "DISPATCHED_TERMINAL_UNCERTAIN" if dispatched else "NOT_DISPATCHED_SAFE_FAILURE"
+        super().__init__(f"ACTOR_DEADLINE_EXCEEDED_{state}: {operation}")
+
+
+class _CallDispatchState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._dispatched = False
+        self._cancelled = False
+
+    def begin(self, deadline: float | None) -> bool:
+        with self._lock:
+            if self._cancelled or (deadline is not None and time.monotonic() >= deadline):
+                self._cancelled = True
+                return False
+            self._dispatched = True
+            return True
+
+    def cancel_if_queued(self) -> bool:
+        with self._lock:
+            if self._dispatched:
+                return False
+            self._cancelled = True
+            return True
+
+
+@dataclass(frozen=True)
+class _ScheduledCall:
+    future: asyncio.Future[Any]
+    concurrent_future: Any
+    generation: int
+    attempt: int
+    dispatch_state: _CallDispatchState
+    mutation_state: _CallDispatchState | None
+    operation: str
+    deadline: float | None
 
 _SENSITIVE_HEADER = re.compile(r"(?:authorization|cookie|token|secret|api[-_]?key)", re.I)
 _CONFIRMATION = re.compile(
@@ -272,6 +328,10 @@ class BrowserActor:
         self.response_body_limit = response_body_limit
         self.max_network_records = max_network_records
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="browser-actor")
+        self._scheduling_lock = asyncio.Lock()
+        self._transition_pending = False
+        self._state_lock = threading.Lock()
+        self._thread_context = threading.local()
         self._owner_thread: int | None = None
         self._playwright: Any = None
         self._browser: Any = None
@@ -279,6 +339,11 @@ class BrowserActor:
         self._page: Any = None
         self._cdp: Any = None
         self._closed = False
+        self._poisoned_reason: str | None = None
+        self._generation = 0
+        self._attempt_counter = 0
+        self._invalid_attempts: set[tuple[int, int]] = set()
+        self._attempt_windows: dict[tuple[int, int], dict[str, float | None]] = {}
         self._connected = False
         self._bid_counter = 1
         self._step_counter = 0
@@ -289,8 +354,8 @@ class BrowserActor:
         self._network_records: list[dict[str, Any]] = []
         self._dialogs: list[dict[str, Any]] = []
         self._downloads: list[dict[str, Any]] = []
-        self._next_dialog_action: tuple[str, str | None] = ("dismiss", None)
-        self._new_pages: list[str] = []
+        self._next_dialog_action: tuple[str, str | None, int] = ("dismiss", None, self._generation)
+        self._new_pages: list[dict[str, Any]] = []
         self._attached_pages: set[int] = set()
         self._pdf_responses: list[Any] = []
         self._last_dom_hash: str | None = None
@@ -298,12 +363,351 @@ class BrowserActor:
         self._last_capture_semantic: str | None = None
         self._last_capture_path: str | None = None
         self._last_observation_semantic: str | None = None
+        self._bind_evidence_store(self.evidence_store, self._generation)
 
-    async def _call(self, function: Callable[..., T], *args: Any) -> T:
-        if self._closed and function is not self._close_sync:
-            raise RuntimeError("BrowserActor 已关闭")
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, function, *args)
+    @property
+    def poisoned(self) -> bool:
+        with self._state_lock:
+            return self._poisoned_reason is not None
+
+    @property
+    def poisoned_reason(self) -> str | None:
+        with self._state_lock:
+            return self._poisoned_reason
+
+    @property
+    def task_generation(self) -> int:
+        with self._state_lock:
+            return self._generation
+
+    def _current_attempt(self) -> int:
+        return int(getattr(self._thread_context, "attempt", self._attempt_counter))
+
+    def _binding(self) -> tuple[int, int]:
+        return (
+            int(getattr(self._thread_context, "generation", self.task_generation)),
+            self._current_attempt(),
+        )
+
+    def _reserve_generation(self) -> int:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("BrowserActor 已关闭")
+            if self._poisoned_reason is not None:
+                raise BrowserActorPoisonedError(self._poisoned_reason)
+            self._generation += 1
+            self._attempt_counter = 0
+            self._invalid_attempts.clear()
+            self._attempt_windows.clear()
+            return self._generation
+
+    def _reserve_attempt(self) -> tuple[int, int]:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("BrowserActor 已关闭")
+            if self._poisoned_reason is not None:
+                raise BrowserActorPoisonedError(self._poisoned_reason)
+            self._attempt_counter += 1
+            return self._generation, self._attempt_counter
+
+    def _mark_poisoned(self, generation: int, reason: str) -> None:
+        with self._state_lock:
+            if generation == self._generation and self._poisoned_reason is None:
+                self._poisoned_reason = reason
+
+    def _assert_publishable(
+        self,
+        generation: int | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        bound_generation, bound_attempt = self._binding()
+        expected_generation = bound_generation if generation is None else generation
+        expected_attempt = bound_attempt if attempt is None else attempt
+        with self._state_lock:
+            if expected_generation != self._generation:
+                raise BrowserActorPoisonedError("STALE_TASK_GENERATION: 迟到结果已隔离")
+            if (expected_generation, expected_attempt) in self._invalid_attempts:
+                raise BrowserActorPoisonedError("STALE_TASK_ATTEMPT: 迟到结果已隔离")
+            if self._poisoned_reason is not None:
+                raise BrowserActorPoisonedError(self._poisoned_reason)
+
+    def _bind_evidence_store(self, store: EvidenceStore, generation: int) -> None:
+        store.bind(
+            generation,
+            self._current_attempt,
+            lambda operation, expected_generation=generation: self._publish_evidence(
+                expected_generation,
+                operation,
+            ),
+        )
+
+    def _publish_evidence(self, expected_generation: int, operation: Callable[[], T]) -> T:
+        generation, attempt = self._binding()
+        with self._state_lock:
+            if expected_generation != generation or generation != self._generation:
+                raise BrowserActorPoisonedError("STALE_TASK_GENERATION: 迟到证据已隔离")
+            if (generation, attempt) in self._invalid_attempts:
+                raise BrowserActorPoisonedError("STALE_TASK_ATTEMPT: 迟到证据已隔离")
+            if self._poisoned_reason is not None:
+                raise BrowserActorPoisonedError(self._poisoned_reason)
+            if self._closed:
+                raise BrowserActorPoisonedError("ACTOR_CLOSED: 证据写入已拒绝")
+            return operation()
+
+    def _publish_event(
+        self,
+        generation: int,
+        operation: Callable[[], None],
+        attempt: int | None = None,
+    ) -> bool:
+        expected_attempt = self._binding()[1] if attempt is None else attempt
+        with self._state_lock:
+            if (
+                generation != self._generation
+                or (generation, expected_attempt) in self._invalid_attempts
+                or self._poisoned_reason is not None
+                or self._closed
+            ):
+                return False
+            operation()
+            return True
+
+    def _invalidate_attempt(self, generation: int, attempt: int, poison_reason: str | None = None) -> None:
+        with self._state_lock:
+            self._invalid_attempts.add((generation, attempt))
+            if poison_reason is not None and generation == self._generation and self._poisoned_reason is None:
+                self._poisoned_reason = poison_reason
+            self._network_records = [
+                item
+                for item in self._network_records
+                if (item.get("task_generation"), item.get("attempt")) != (generation, attempt)
+            ]
+            self._dialogs = [
+                item
+                for item in self._dialogs
+                if (item.get("task_generation"), item.get("attempt")) != (generation, attempt)
+            ]
+            self._downloads = [
+                item
+                for item in self._downloads
+                if (item.get("task_generation"), item.get("attempt")) != (generation, attempt)
+            ]
+            self._new_pages = [
+                item
+                for item in self._new_pages
+                if (item.get("task_generation"), item.get("attempt")) != (generation, attempt)
+            ]
+            self._pdf_responses = [
+                item
+                for item in self._pdf_responses
+                if (item.get("task_generation"), item.get("attempt")) != (generation, attempt)
+            ]
+        self.evidence_store.discard_attempt(generation, attempt)
+
+    def _event_is_current(self, generation: int) -> bool:
+        with self._state_lock:
+            return generation == self._generation and self._poisoned_reason is None and not self._closed
+
+    def _execute_call(
+        self,
+        generation: int,
+        attempt: int,
+        dispatch_state: _CallDispatchState,
+        mutation_state: _CallDispatchState | None,
+        deadline: float | None,
+        operation: str,
+        function: Callable[..., T],
+        args: tuple[Any, ...],
+        allow_poisoned: bool,
+    ) -> T:
+        with self._state_lock:
+            if generation != self._generation and not allow_poisoned:
+                raise BrowserActorPoisonedError("STALE_TASK_GENERATION: 调用未派发")
+            if self._poisoned_reason is not None and not allow_poisoned:
+                raise BrowserActorPoisonedError(self._poisoned_reason)
+        if not dispatch_state.begin(deadline):
+            raise ActorCallDeadlineExceeded(
+                operation,
+                dispatched=False,
+                task_generation=generation,
+                attempt=attempt,
+            )
+        self._thread_context.generation = generation
+        self._thread_context.attempt = attempt
+        self._thread_context.mutation_state = mutation_state
+        self._thread_context.deadline = deadline
+        self._thread_context.operation = operation
+        self._thread_context.mutation_dispatched = False
+        with self._state_lock:
+            self._attempt_windows[(generation, attempt)] = {
+                "started_ms": time.time() * 1_000,
+                "ended_ms": None,
+                "mutation_dispatched_ms": None,
+            }
+        try:
+            result = function(*args)
+            if not allow_poisoned:
+                self._assert_publishable(generation, attempt)
+            if isinstance(result, dict):
+                result.setdefault("task_generation", generation)
+                result.setdefault("attempt", attempt)
+            return result
+        finally:
+            with self._state_lock:
+                window = self._attempt_windows.get((generation, attempt))
+                if window is not None:
+                    window["ended_ms"] = time.time() * 1_000
+            self._thread_context.generation = generation
+            self._thread_context.attempt = 0
+            self._thread_context.mutation_state = None
+            self._thread_context.deadline = None
+            self._thread_context.mutation_dispatched = False
+
+    def _schedule_call(
+        self,
+        function: Callable[..., T],
+        *args: Any,
+        deadline: float | None = None,
+        operation: str | None = None,
+        allow_poisoned: bool = False,
+        mutation_aware: bool = False,
+    ) -> _ScheduledCall:
+        if allow_poisoned:
+            with self._state_lock:
+                generation = self._generation
+                self._attempt_counter += 1
+                attempt = self._attempt_counter
+        else:
+            generation, attempt = self._reserve_attempt()
+        dispatch_state = _CallDispatchState()
+        mutation_state = _CallDispatchState() if mutation_aware else None
+        operation_name = operation or getattr(function, "__name__", "call")
+        concurrent_future = self._executor.submit(
+            self._execute_call,
+            generation,
+            attempt,
+            dispatch_state,
+            mutation_state,
+            deadline,
+            operation_name,
+            function,
+            args,
+            allow_poisoned,
+        )
+        future = asyncio.wrap_future(concurrent_future)
+        return _ScheduledCall(
+            future=future,
+            concurrent_future=concurrent_future,
+            generation=generation,
+            attempt=attempt,
+            dispatch_state=dispatch_state,
+            mutation_state=mutation_state,
+            operation=operation_name,
+            deadline=deadline,
+        )
+
+    async def _await_scheduled_call(self, call: _ScheduledCall) -> T:
+        future = call.future
+
+        def consume_late_result(done: asyncio.Future[Any]) -> None:
+            try:
+                done.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        timeout = max(0.0, call.deadline - time.monotonic()) if call.deadline is not None else None
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            if future.done():
+                return future.result()
+            terminal_state = call.mutation_state or call.dispatch_state
+            was_dispatched = not terminal_state.cancel_if_queued()
+            poison_reason = (
+                f"ACTOR_POISONED: {call.operation} 超时且终态不确定"
+                if was_dispatched
+                else None
+            )
+            self._invalidate_attempt(call.generation, call.attempt, poison_reason)
+            if was_dispatched:
+                future.add_done_callback(consume_late_result)
+            else:
+                call.concurrent_future.cancel()
+            raise ActorCallDeadlineExceeded(
+                call.operation,
+                dispatched=was_dispatched,
+                task_generation=call.generation,
+                attempt=call.attempt,
+            ) from None
+        except asyncio.CancelledError:
+            terminal_state = call.mutation_state or call.dispatch_state
+            was_dispatched = not terminal_state.cancel_if_queued()
+            poison_reason = (
+                f"ACTOR_POISONED: {call.operation} 被取消且终态不确定"
+                if was_dispatched
+                else None
+            )
+            self._invalidate_attempt(call.generation, call.attempt, poison_reason)
+            if was_dispatched:
+                future.add_done_callback(consume_late_result)
+            else:
+                call.concurrent_future.cancel()
+            raise
+
+    async def _call(
+        self,
+        function: Callable[..., T],
+        *args: Any,
+        deadline: float | None = None,
+        operation: str | None = None,
+        allow_poisoned: bool = False,
+        mutation_aware: bool = False,
+    ) -> T:
+        if self._transition_pending and not allow_poisoned:
+            raise BrowserActorPoisonedError("STALE_TASK_TRANSITION: 任务切换期间拒绝新动作")
+        async with self._scheduling_lock:
+            if self._transition_pending and not allow_poisoned:
+                raise BrowserActorPoisonedError("STALE_TASK_TRANSITION: 任务切换期间拒绝新动作")
+            call = self._schedule_call(
+                function,
+                *args,
+                deadline=deadline,
+                operation=operation,
+                allow_poisoned=allow_poisoned,
+                mutation_aware=mutation_aware,
+            )
+        return await self._await_scheduled_call(call)
+
+    async def _transition_task(
+        self,
+        function: Callable[..., T],
+        *args: Any,
+        deadline: float,
+        operation: str,
+        evidence_store: EvidenceStore,
+    ) -> T:
+        if self._transition_pending:
+            raise BrowserActorPoisonedError("STALE_TASK_TRANSITION: 已有任务切换正在进行")
+        self._transition_pending = True
+        try:
+            async with self._scheduling_lock:
+                barrier = self._schedule_call(
+                    lambda: None,
+                    deadline=deadline,
+                    operation=f"{operation}_barrier",
+                )
+                await self._await_scheduled_call(barrier)
+                generation = self._reserve_generation()
+                self._bind_evidence_store(evidence_store, generation)
+                call = self._schedule_call(
+                    function,
+                    *args,
+                    deadline=deadline,
+                    operation=operation,
+                )
+            return await self._await_scheduled_call(call)
+        finally:
+            self._transition_pending = False
 
     def _assert_thread(self) -> None:
         current = threading.get_ident()
@@ -313,7 +717,13 @@ class BrowserActor:
             raise RuntimeError("Playwright 操作越过 BrowserActor 线程边界")
 
     async def start(self, initial_url: str) -> dict[str, Any]:
-        return await self._call(self._start_sync, initial_url)
+        return await self._transition_task(
+            self._start_sync,
+            initial_url,
+            deadline=time.monotonic() + 100.0,
+            operation="start",
+            evidence_store=self.evidence_store,
+        )
 
     async def begin_task(
         self,
@@ -321,7 +731,15 @@ class BrowserActor:
         output_dir: Path,
         evidence_store: EvidenceStore,
     ) -> dict[str, Any]:
-        return await self._call(self._begin_task_sync, initial_url, Path(output_dir), evidence_store)
+        return await self._transition_task(
+            self._begin_task_sync,
+            initial_url,
+            Path(output_dir),
+            evidence_store,
+            deadline=time.monotonic() + 100.0,
+            operation="begin_task",
+            evidence_store=evidence_store,
+        )
 
     def _start_sync(self, initial_url: str) -> dict[str, Any]:
         self._assert_thread()
@@ -336,9 +754,10 @@ class BrowserActor:
         kwargs = {"headers": headers} if headers else {}
         self._browser = self._playwright.chromium.connect_over_cdp(self.cdp_url, **kwargs)
         self._connected = True
+        generation, _ = self._binding()
         self._browser.on("disconnected", self._on_disconnected)
         self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
-        self._context.on("page", self._on_page)
+        self._context.on("page", lambda page: self._on_page(page, generation))
         return self._prepare_task(initial_url)
 
     def _begin_task_sync(
@@ -350,6 +769,11 @@ class BrowserActor:
         self._assert_thread()
         self.output_dir = output_dir
         self.evidence_store = evidence_store
+        generation, _ = self._binding()
+        self._bind_evidence_store(self.evidence_store, generation)
+        if self._context is not None:
+            self._context.on("page", lambda page: self._on_page(page, generation))
+        self._attached_pages = set()
         self._bid_counter = 1
         self._step_counter = 0
         self._action_counter = 0
@@ -359,6 +783,7 @@ class BrowserActor:
         self._network_records = []
         self._dialogs = []
         self._downloads = []
+        self._next_dialog_action = ("dismiss", None, generation)
         self._new_pages = []
         self._pdf_responses = []
         self._last_dom_hash = None
@@ -380,7 +805,8 @@ class BrowserActor:
             except Exception:
                 pass
         self._page = self._context.new_page()
-        self._attach_page(self._page)
+        generation, _ = self._binding()
+        self._attach_page(self._page, generation)
         self._page.goto(initial_url, wait_until="domcontentloaded", timeout=60_000)
         self._settle()
         self._refresh_cdp()
@@ -397,32 +823,71 @@ class BrowserActor:
         self._last_dom_hash = None
         self._last_semantic_state = None
 
-    def _attach_page(self, page: Any) -> None:
+    def _attach_page(self, page: Any, generation: int | None = None) -> None:
+        generation = self.task_generation if generation is None else generation
+        if not self._event_is_current(generation):
+            return
         identity = id(page)
         if identity in self._attached_pages:
             return
         self._attached_pages.add(identity)
         page.set_default_timeout(self.click_timeout_ms)
-        page.on("response", self._on_response)
-        page.on("dialog", self._on_dialog)
-        page.on("crash", lambda: setattr(self, "_connected", False))
+        page.on("response", lambda response: self._on_response(response, generation))
+        page.on("dialog", lambda dialog: self._on_dialog(dialog, generation))
+        page.on("crash", lambda: self._on_page_crash(generation))
 
-    def _on_disconnected(self) -> None:
-        self._connected = False
+    def _on_disconnected(self, generation: int | None = None) -> None:
+        generation = self.task_generation if generation is None else generation
+        with self._state_lock:
+            if generation != self._generation or self._poisoned_reason is not None or self._closed:
+                return
+            self._connected = False
+            self._poisoned_reason = "ACTOR_POISONED: CDP_DISCONNECTED"
 
-    def _on_page(self, page: Any) -> None:
+    def _on_page_crash(self, generation: int) -> None:
+        with self._state_lock:
+            if generation != self._generation or self._poisoned_reason is not None or self._closed:
+                return
+            self._connected = False
+            self._poisoned_reason = "ACTOR_POISONED: PAGE_CRASHED"
+
+    def _on_page(self, page: Any, generation: int | None = None) -> None:
         self._assert_thread()
-        self._attach_page(page)
-        self._new_pages.append(sanitize_url(page.url))
+        generation = self._binding()[0] if generation is None else generation
+        if not self._event_is_current(generation):
+            return
+        self._attach_page(page, generation)
+        task_generation, attempt = self._binding()
+        record = {
+            "url": sanitize_url(page.url),
+            "task_generation": task_generation,
+            "attempt": attempt,
+        }
+        self._publish_event(
+            generation,
+            lambda: self._new_pages.append(record),
+        )
 
-    def _on_dialog(self, dialog: Any) -> None:
+    def _on_dialog(self, dialog: Any, generation: int | None = None) -> None:
         self._assert_thread()
-        action, prompt_text = self._next_dialog_action
+        generation = self._binding()[0] if generation is None else generation
+        action, prompt_text, armed_generation = self._next_dialog_action
+        if not self._event_is_current(generation):
+            try:
+                dialog.dismiss()
+            except Exception:
+                pass
+            return
+        if armed_generation != generation:
+            action, prompt_text = "dismiss", None
+        task_generation, attempt = self._binding()
         record = {
             "type": dialog.type,
             "message": redact_text(dialog.message),
             "action": action,
             "url": sanitize_url(self._page.url),
+            "task_generation": task_generation,
+            "attempt": attempt,
         }
         try:
             if action == "accept":
@@ -431,25 +896,57 @@ class BrowserActor:
                 dialog.dismiss()
         except Exception as exc:
             record["error"] = _error_type(exc)
-        self._dialogs.append(record)
-        self._next_dialog_action = ("dismiss", None)
+            self._publish_event(generation, lambda: self._dialogs.append(record), attempt)
+            self._next_dialog_action = ("dismiss", None, generation)
+            reason = f"ACTOR_POISONED: dialog {action} 异常且终态不确定"
+            self._mark_poisoned(task_generation, reason)
+            raise BrowserActorPoisonedError(reason) from exc
+        self._publish_event(generation, lambda: self._dialogs.append(record), attempt)
+        self._next_dialog_action = ("dismiss", None, generation)
 
-    def _on_response(self, response: Any) -> None:
+    def _on_response(self, response: Any, generation: int | None = None) -> None:
         self._assert_thread()
-        try:
-            self._capture_response(response)
-        except Exception as exc:
-            if len(self._network_records) < self.max_network_records:
-                self._network_records.append({"capture_error": _error_type(exc)})
-
-    def _capture_response(self, response: Any) -> None:
-        content_type = response.headers.get("content-type", "").lower()
-        if "application/pdf" in content_type:
-            self._pdf_responses.append(response)
-        if len(self._network_records) >= self.max_network_records:
+        generation = self._binding()[0] if generation is None else generation
+        if not self._event_is_current(generation):
             return
+        try:
+            self._capture_response(response, generation)
+        except Exception as exc:
+            task_generation, attempt = self._binding()
+            record = {
+                "capture_error": _error_type(exc),
+                "task_generation": task_generation,
+                "attempt": attempt,
+            }
+            self._publish_event(
+                generation,
+                lambda: self._network_records.append(record)
+                if len(self._network_records) < self.max_network_records
+                else None,
+            )
+
+    def _capture_response(self, response: Any, generation: int) -> None:
+        content_type = response.headers.get("content-type", "").lower()
+        is_pdf = "application/pdf" in content_type
         request = response.request
+        task_generation, attempt, request_started_ms, mutation_correlated = self._request_binding(
+            request,
+            generation,
+        )
+        pdf_entry = {
+            "response": response,
+            "task_generation": task_generation,
+            "attempt": attempt,
+            "request_started_ms": request_started_ms,
+            "mutation_correlated": mutation_correlated,
+        }
         if request.resource_type not in {"xhr", "fetch"}:
+            if is_pdf:
+                self._publish_event(
+                    generation,
+                    lambda: self._pdf_responses.append(pdf_entry),
+                    attempt,
+                )
             return
         record: dict[str, Any] = {
             "url": sanitize_url(response.url),
@@ -501,11 +998,79 @@ class BrowserActor:
                     record["body_truncated"] = len(body) > self.response_body_limit
                 except Exception as exc:
                     record["body_error"] = _error_type(exc)
-        self._network_records.append(record)
+        record.update({"task_generation": task_generation, "attempt": attempt})
+
+        def publish() -> None:
+            if is_pdf:
+                self._pdf_responses.append(pdf_entry)
+            if len(self._network_records) < self.max_network_records:
+                self._network_records.append(record)
+
+        self._publish_event(generation, publish, attempt)
+
+    def _request_binding(
+        self,
+        request: Any,
+        generation: int,
+    ) -> tuple[int, int, float | None, bool]:
+        try:
+            request_started_ms = float(request.timing.get("startTime"))
+            if request_started_ms < 10_000_000_000:
+                request_started_ms *= 1_000
+        except (AttributeError, TypeError, ValueError):
+            request_started_ms = None
+        current_generation, current_attempt = self._binding()
+        if request_started_ms is None:
+            return (
+                generation,
+                current_attempt if generation == current_generation else 0,
+                None,
+                False,
+            )
+        with self._state_lock:
+            candidates = [
+                (attempt, window)
+                for (window_generation, attempt), window in self._attempt_windows.items()
+                if window_generation == generation
+                and float(window["started_ms"] or 0) <= request_started_ms
+                and (
+                    window["ended_ms"] is None
+                    or request_started_ms <= float(window["ended_ms"])
+                )
+            ]
+        if not candidates:
+            return generation, 0, request_started_ms, False
+        attempt, window = max(candidates, key=lambda item: float(item[1]["started_ms"] or 0))
+        mutation_started_ms = window.get("mutation_dispatched_ms")
+        mutation_correlated = bool(
+            mutation_started_ms is not None
+            and request_started_ms >= float(mutation_started_ms)
+        )
+        return generation, attempt, request_started_ms, mutation_correlated
+
+    @staticmethod
+    def _response_matches_target(response: Any, target_url: str) -> bool:
+        expected = urlsplit(target_url)._replace(fragment="").geturl()
+        candidates = [getattr(response, "url", "")]
+        request = getattr(response, "request", None)
+        seen: set[int] = set()
+        while request is not None and id(request) not in seen:
+            seen.add(id(request))
+            candidates.append(getattr(request, "url", ""))
+            candidates.append(getattr(getattr(request, "frame", None), "url", ""))
+            request = getattr(request, "redirected_from", None)
+        return any(
+            isinstance(candidate, str)
+            and urlsplit(candidate)._replace(fragment="").geturl() == expected
+            for candidate in candidates
+        )
 
     def _ensure_live(self) -> None:
+        self._assert_publishable()
         if not self._connected or self._page is None or self._page.is_closed():
-            raise RuntimeError("浏览器已崩溃、页面已关闭或 CDP 已断开")
+            generation, _ = self._binding()
+            self._mark_poisoned(generation, "ACTOR_POISONED: PAGE_OR_CDP_UNAVAILABLE")
+            raise BrowserActorPoisonedError(self.poisoned_reason or "ACTOR_POISONED")
 
     def _settle(self) -> dict[str, Any] | None:
         self._ensure_live()
@@ -642,7 +1207,11 @@ class BrowserActor:
         return self._last_capture_path
 
     async def observe(self) -> dict[str, Any]:
-        return await self._call(self._observe_sync)
+        return await self._call(
+            self._observe_sync,
+            deadline=time.monotonic() + 29.0,
+            operation="observe",
+        )
 
     def _observe_sync(self) -> dict[str, Any]:
         self._assert_thread()
@@ -676,6 +1245,7 @@ class BrowserActor:
         finally:
             browsergym_post_extract(self._page)
         dom_hash = self._dom_hash()
+        self._assert_publishable()
         artifact = self.output_dir / "observations" / f"{self._observation_counter:03d}.json.gz"
         self._observation_counter += 1
         with gzip.open(artifact, "wt", encoding="utf-8") as output:
@@ -748,21 +1318,37 @@ class BrowserActor:
             raise LookupError(f"STALE_BID: {bid} 不存在，请重新 observe") from exc
 
     async def click(self, bid: str) -> dict[str, Any]:
-        return await self._call(self._action_sync, "click", lambda: self._click_op(bid), bid)
+        return await self._call(
+            self._action_sync,
+            "click",
+            lambda: self._click_op(bid),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="click",
+            mutation_aware=True,
+        )
 
     def _click_op(self, bid: str) -> dict[str, Any]:
         locator = self._locator(bid)
         target = self._element_state(locator)
-        locator.click(timeout=self.click_timeout_ms)
+        self._dispatch_mutation(lambda: locator.click(timeout=self.click_timeout_ms))
         return {"target": target}
 
     async def fill(self, bid: str, value: str) -> dict[str, Any]:
-        return await self._call(self._action_sync, "fill", lambda: self._fill_op(bid, value), bid)
+        return await self._call(
+            self._action_sync,
+            "fill",
+            lambda: self._fill_op(bid, value),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="fill",
+            mutation_aware=True,
+        )
 
     def _fill_op(self, bid: str, value: str) -> dict[str, Any]:
         locator = self._locator(bid)
         before = locator.input_value()
-        locator.fill(value, timeout=self.click_timeout_ms)
+        self._dispatch_mutation(lambda: locator.fill(value, timeout=self.click_timeout_ms))
         is_password = (locator.get_attribute("type") or "").casefold() == "password"
         after = locator.input_value()
         return {
@@ -773,12 +1359,20 @@ class BrowserActor:
         }
 
     async def select(self, bid: str, values: list[str]) -> dict[str, Any]:
-        return await self._call(self._action_sync, "select", lambda: self._select_op(bid, values), bid)
+        return await self._call(
+            self._action_sync,
+            "select",
+            lambda: self._select_op(bid, values),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="select",
+            mutation_aware=True,
+        )
 
     def _select_op(self, bid: str, values: list[str]) -> dict[str, Any]:
         locator = self._locator(bid)
         before = locator.input_value()
-        selected = locator.select_option(values, timeout=self.click_timeout_ms)
+        selected = self._dispatch_mutation(lambda: locator.select_option(values, timeout=self.click_timeout_ms))
         after = locator.input_value()
         return {
             "selected": selected,
@@ -790,13 +1384,19 @@ class BrowserActor:
 
     async def set_checked(self, bid: str, checked: bool) -> dict[str, Any]:
         return await self._call(
-            self._action_sync, "set_checked", lambda: self._set_checked_op(bid, checked), bid
+            self._action_sync,
+            "set_checked",
+            lambda: self._set_checked_op(bid, checked),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="set_checked",
+            mutation_aware=True,
         )
 
     def _set_checked_op(self, bid: str, checked: bool) -> dict[str, Any]:
         locator = self._locator(bid)
         before = locator.is_checked()
-        locator.set_checked(checked, timeout=self.click_timeout_ms)
+        self._dispatch_mutation(lambda: locator.set_checked(checked, timeout=self.click_timeout_ms))
         after = locator.is_checked()
         return {
             "before_checked": before,
@@ -806,30 +1406,51 @@ class BrowserActor:
         }
 
     async def press(self, key: str, bid: str | None = None) -> dict[str, Any]:
-        return await self._call(self._action_sync, "press", lambda: self._press_op(key, bid), bid)
+        return await self._call(
+            self._action_sync,
+            "press",
+            lambda: self._press_op(key, bid),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="press",
+            mutation_aware=True,
+        )
 
     def _press_op(self, key: str, bid: str | None) -> dict[str, Any]:
         if bid:
-            self._locator(bid).press(key, timeout=self.click_timeout_ms)
+            locator = self._locator(bid)
+            self._dispatch_mutation(lambda: locator.press(key, timeout=self.click_timeout_ms))
         else:
-            self._page.keyboard.press(key)
+            self._dispatch_mutation(lambda: self._page.keyboard.press(key))
         return {"key": key, "bid": bid}
 
     async def scroll(self, delta_y: int, bid: str | None = None) -> dict[str, Any]:
         delta_y = min(max(int(delta_y), -4_000), 4_000)
-        return await self._call(self._action_sync, "scroll", lambda: self._scroll_op(delta_y, bid), bid)
+        return await self._call(
+            self._action_sync,
+            "scroll",
+            lambda: self._scroll_op(delta_y, bid),
+            bid,
+            deadline=time.monotonic() + 11.0,
+            operation="scroll",
+            mutation_aware=True,
+        )
 
     def _scroll_op(self, delta_y: int, bid: str | None) -> dict[str, Any]:
         if bid:
             locator = self._locator(bid)
-            result = locator.evaluate(
-                "(el, dy) => { const before=el.scrollTop; el.scrollBy(0,dy); return {before,after:el.scrollTop,height:el.scrollHeight,client:el.clientHeight}; }",
-                delta_y,
+            result = self._dispatch_mutation(
+                lambda: locator.evaluate(
+                    "(el, dy) => { const before=el.scrollTop; el.scrollBy(0,dy); return {before,after:el.scrollTop,height:el.scrollHeight,client:el.clientHeight}; }",
+                    delta_y,
+                )
             )
         else:
-            result = self._page.evaluate(
-                "dy => { const before=scrollY; scrollBy(0,dy); return {before,after:scrollY,height:document.documentElement.scrollHeight,client:innerHeight}; }",
-                delta_y,
+            result = self._dispatch_mutation(
+                lambda: self._page.evaluate(
+                    "dy => { const before=scrollY; scrollBy(0,dy); return {before,after:scrollY,height:document.documentElement.scrollHeight,client:innerHeight}; }",
+                    delta_y,
+                )
             )
         return {"delta_y": delta_y, "bid": bid, **result}
 
@@ -840,25 +1461,43 @@ class BrowserActor:
             "wait",
             lambda: self._wait_op(milliseconds),
             None,
+            deadline=time.monotonic() + 11.0,
+            operation="wait",
+            mutation_aware=True,
         )
 
     def _wait_op(self, milliseconds: int) -> dict[str, Any]:
-        self._page.wait_for_timeout(milliseconds)
+        self._dispatch_mutation(lambda: self._page.wait_for_timeout(milliseconds))
         return {"milliseconds": milliseconds}
 
     async def arm_dialog(self, action: str, prompt_text: str | None = None) -> dict[str, Any]:
-        return await self._call(self._arm_dialog_sync, action, prompt_text)
+        return await self._call(
+            self._arm_dialog_sync,
+            action,
+            prompt_text,
+            deadline=time.monotonic() + 4.0,
+            operation="dialog",
+        )
 
     def _arm_dialog_sync(self, action: str, prompt_text: str | None) -> dict[str, Any]:
         self._assert_thread()
         if action not in {"accept", "dismiss"}:
             raise ValueError("dialog action 仅支持 accept 或 dismiss")
-        self._next_dialog_action = (action, prompt_text)
+        generation, _ = self._binding()
+        self._next_dialog_action = (action, prompt_text, generation)
         self._capture_step("dialog:arm")
         return {"armed": True, "action": action}
 
     async def tabs(self, action: str, index: int | None = None, url: str | None = None) -> dict[str, Any]:
-        return await self._call(self._tabs_sync, action, index, url)
+        return await self._call(
+            self._tabs_sync,
+            action,
+            index,
+            url,
+            deadline=time.monotonic() + 11.0,
+            operation="tabs",
+            mutation_aware=action != "list",
+        )
 
     def _tabs_sync(self, action: str, index: int | None, url: str | None) -> dict[str, Any]:
         self._assert_thread()
@@ -874,41 +1513,61 @@ class BrowserActor:
                 ],
                 "semantic_page_fingerprint": state["semantic_page_fingerprint"],
             }
-        if action == "switch":
-            if index is None or index < 0 or index >= len(pages):
-                raise ValueError("tab index 越界")
-            self._page = pages[index]
-            self._page.bring_to_front()
-            self._refresh_cdp()
-        elif action == "close":
-            if len(pages) == 1:
-                raise ValueError("不能关闭最后一个标签页")
-            target = pages[index if index is not None else pages.index(self._page)]
-            target.close(run_before_unload=False)
-            pages = [page for page in self._context.pages if not page.is_closed()]
-            self._page = pages[-1]
-            self._refresh_cdp()
-        elif action == "new":
-            if not url:
-                raise ValueError("新建标签页必须提供 URL")
-            if urlparse(url).scheme not in {"http", "https"}:
-                raise ValueError("新建标签页仅允许 http/https URL")
-            target_url = canonical_url(url)
-            existing = next((page for page in pages if canonical_url(page.url) == target_url), None)
-            if existing is not None:
-                self._page = existing
-                self._page.bring_to_front()
-                self._refresh_cdp()
-                reused = True
+        try:
+            if action == "switch":
+                if index is None or index < 0 or index >= len(pages):
+                    raise ValueError("tab index 越界")
+                target = pages[index]
+
+                def mutate() -> None:
+                    self._page = target
+                    self._page.bring_to_front()
+                    self._refresh_cdp()
+
+                self._dispatch_mutation(mutate)
+            elif action == "close":
+                if len(pages) == 1:
+                    raise ValueError("不能关闭最后一个标签页")
+                target = pages[index if index is not None else pages.index(self._page)]
+
+                def mutate() -> None:
+                    target.close(run_before_unload=False)
+                    remaining = [page for page in self._context.pages if not page.is_closed()]
+                    self._page = remaining[-1]
+                    self._refresh_cdp()
+
+                self._dispatch_mutation(mutate)
+            elif action == "new":
+                if not url:
+                    raise ValueError("新建标签页必须提供 URL")
+                if urlparse(url).scheme not in {"http", "https"}:
+                    raise ValueError("新建标签页仅允许 http/https URL")
+                target_url = canonical_url(url)
+                existing = next((page for page in pages if canonical_url(page.url) == target_url), None)
+
+                def mutate() -> bool:
+                    if existing is not None:
+                        self._page = existing
+                        self._page.bring_to_front()
+                        self._refresh_cdp()
+                        return True
+                    self._page = self._context.new_page()
+                    self._page.goto(url, wait_until="domcontentloaded", timeout=8_000)
+                    self._refresh_cdp()
+                    return False
+
+                reused = self._dispatch_mutation(mutate)
             else:
-                self._page = self._context.new_page()
-                self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                self._refresh_cdp()
-                reused = False
-        else:
-            raise ValueError("tabs action 仅支持 list/switch/close/new")
-        state = self._settle()
-        self._capture_step(f"tabs:{action}")
+                raise ValueError("tabs action 仅支持 list/switch/close/new")
+            state = self._settle()
+            self._capture_step(f"tabs:{action}")
+        except Exception as exc:
+            if bool(getattr(self._thread_context, "mutation_dispatched", False)):
+                generation, _ = self._binding()
+                reason = f"ACTOR_POISONED: tabs:{action} 异常且终态不确定"
+                self._mark_poisoned(generation, reason)
+                raise BrowserActorPoisonedError(reason) from exc
+            raise
         pages = [page for page in self._context.pages if not page.is_closed()]
         return {
             "tabs": [
@@ -920,7 +1579,15 @@ class BrowserActor:
         }
 
     async def upload(self, bid: str, paths: list[str]) -> dict[str, Any]:
-        return await self._call(self._action_sync, "upload", lambda: self._upload_op(bid, paths), bid)
+        return await self._call(
+            self._action_sync,
+            "upload",
+            lambda: self._upload_op(bid, paths),
+            bid,
+            deadline=time.monotonic() + 19.0,
+            operation="upload",
+            mutation_aware=True,
+        )
 
     def _upload_op(self, bid: str, paths: list[str]) -> dict[str, Any]:
         resolved = [Path(path).expanduser().resolve() for path in paths]
@@ -930,19 +1597,31 @@ class BrowserActor:
         allowed_roots = [(self.output_dir.parent).resolve(), *(Path(value).expanduser().resolve() for value in configured)]
         if any(not any(path == root or root in path.parents for root in allowed_roots) for path in resolved):
             raise ValueError("上传路径不在任务输出父目录或 WEBRETRIEVER_UPLOAD_ROOTS 白名单中")
-        self._locator(bid).set_input_files([str(path) for path in resolved])
+        locator = self._locator(bid)
+        self._dispatch_mutation(lambda: locator.set_input_files([str(path) for path in resolved]))
         return {"files": [path.name for path in resolved]}
 
     async def download(self, bid: str) -> dict[str, Any]:
-        return await self._call(self._action_sync, "download", lambda: self._download_op(bid), bid)
+        return await self._call(
+            self._action_sync,
+            "download",
+            lambda: self._download_op(bid),
+            bid,
+            deadline=time.monotonic() + 19.0,
+            operation="download",
+            mutation_aware=True,
+        )
 
     def _download_op(self, bid: str) -> dict[str, Any]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
         pdf_cursor = len(self._pdf_responses)
+        locator = self._locator(bid)
+        href = locator.get_attribute("href")
+        expected_url = urljoin(self._page.url, href) if href else None
         try:
             with self._page.expect_download(timeout=self.click_timeout_ms) as info:
-                self._locator(bid).click(timeout=self.click_timeout_ms)
+                self._dispatch_mutation(lambda: locator.click(timeout=self.click_timeout_ms))
             download = info.value
             destination = self.output_dir / "downloads" / download.suggested_filename
             download.save_as(str(destination))
@@ -952,25 +1631,73 @@ class BrowserActor:
                 "url": sanitize_url(download.url),
             }
         except PlaywrightTimeoutError as exc:
-            candidates = self._pdf_responses[pdf_cursor:]
+            task_generation, attempt = self._binding()
+            timed_candidates = [
+                entry
+                for entry in self._pdf_responses[pdf_cursor:]
+                if (entry.get("task_generation"), entry.get("attempt"))
+                == (task_generation, attempt)
+                and entry.get("mutation_correlated") is True
+            ]
+            candidates = [
+                entry
+                for entry in timed_candidates
+                if expected_url is not None
+                and self._response_matches_target(entry["response"], expected_url)
+            ]
             if not candidates:
                 raise RuntimeError("点击后既未触发下载，也未收到浏览器内联 PDF 响应") from exc
-            response = candidates[-1]
-            parsed_name = Path(urlparse(response.url).path).name
+            response: Any = None
+            pdf_body: bytes | None = None
+            for candidate in reversed(candidates):
+                candidate_response = candidate["response"]
+                try:
+                    candidate_body = candidate_response.body()
+                except Exception:
+                    continue
+                if b"%PDF-" in candidate_body[:1_024]:
+                    response = candidate_response
+                    pdf_body = candidate_body
+                    break
+            if response is None or pdf_body is None:
+                candidate_urls = [
+                    {
+                        "response": sanitize_url(entry["response"].url),
+                        "frame": sanitize_url(
+                            str(getattr(getattr(entry["response"].request, "frame", None), "url", ""))
+                        ),
+                    }
+                    for entry in timed_candidates
+                ]
+                raise RuntimeError(
+                    f"点击后的关联响应不包含有效 PDF 文件签名；候选 URL: {candidate_urls}"
+                ) from exc
+            public_url = expected_url or response.url
+            parsed_name = Path(urlparse(public_url).path).name
             filename = parsed_name if parsed_name.lower().endswith(".pdf") else "browser-inline.pdf"
             destination = self.output_dir / "downloads" / filename
-            destination.write_bytes(response.body())
+            destination.write_bytes(pdf_body)
             record = {
                 "filename": filename,
                 "path": str(destination),
-                "url": sanitize_url(response.url),
+                "url": sanitize_url(public_url),
                 "inline_pdf": True,
             }
-        self._downloads.append(record)
+        task_generation, attempt = self._binding()
+        record.update({"task_generation": task_generation, "attempt": attempt})
+        if not self._publish_event(task_generation, lambda: self._downloads.append(record), attempt):
+            self._assert_publishable(task_generation, attempt)
         return {"download": record}
 
     async def extract(self, kind: str, bid: str | None = None, limit: int = 1_000) -> dict[str, Any]:
-        return await self._call(self._extract_sync, kind, bid, min(max(limit, 1), 5_000))
+        return await self._call(
+            self._extract_sync,
+            kind,
+            bid,
+            min(max(limit, 1), 5_000),
+            deadline=time.monotonic() + 19.0,
+            operation="extract",
+        )
 
     def _extract_sync(self, kind: str, bid: str | None, limit: int) -> dict[str, Any]:
         self._assert_thread()
@@ -993,6 +1720,7 @@ class BrowserActor:
             )
         else:
             raise ValueError("extract kind 仅支持 text/links/table/list")
+        self._assert_publishable()
         evidence = self.evidence_store.add(
             "dom", sanitize_url(self._page.url), f"结构化提取 {kind}", {"kind": kind, "bid": bid, "data": data}
         )
@@ -1010,7 +1738,12 @@ class BrowserActor:
         }
 
     async def extract_many(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return await self._call(self._extract_many_sync, requests)
+        return await self._call(
+            self._extract_many_sync,
+            requests,
+            deadline=time.monotonic() + 29.0,
+            operation="extract_many",
+        )
 
     def _extract_many_sync(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         self._assert_thread()
@@ -1027,13 +1760,19 @@ class BrowserActor:
         return results
 
     async def network_events(self, since_last: bool = True) -> dict[str, Any]:
-        return await self._call(self._network_events_sync, since_last)
+        return await self._call(
+            self._network_events_sync,
+            since_last,
+            deadline=time.monotonic() + 19.0,
+            operation="network",
+        )
 
     def _network_events_sync(self, since_last: bool) -> dict[str, Any]:
         self._assert_thread()
         start = self._network_cursor if since_last else 0
         records = self._network_records[start:]
         self._network_cursor = len(self._network_records)
+        self._assert_publishable()
         evidence = self.evidence_store.add(
             "network",
             self._page.url,
@@ -1044,7 +1783,12 @@ class BrowserActor:
         return {"records": records, "evidence_id": evidence.evidence_id}
 
     async def extract_document(self, path: str) -> dict[str, Any]:
-        return await self._call(self._extract_document_sync, path)
+        return await self._call(
+            self._extract_document_sync,
+            path,
+            deadline=time.monotonic() + 29.0,
+            operation="document",
+        )
 
     def _extract_document_sync(self, path: str) -> dict[str, Any]:
         self._assert_thread()
@@ -1060,6 +1804,7 @@ class BrowserActor:
             chunks = [(page.extract_text() or "") for page in reader.pages]
             data = "\n\n".join(chunks)[:500_000]
             pages = len(reader.pages)
+        self._assert_publishable()
         evidence = self.evidence_store.add(
             "document", self._page.url, f"下载文档 {target.name}，{pages} 页", {"path": str(target), "pages": pages, "text": data}
         )
@@ -1067,7 +1812,13 @@ class BrowserActor:
         return {"path": str(target), "pages": pages, "text": data, "evidence_id": evidence.evidence_id}
 
     async def visual_crop(self, bid: str, question: str) -> dict[str, Any]:
-        return await self._call(self._visual_crop_sync, bid, question)
+        return await self._call(
+            self._visual_crop_sync,
+            bid,
+            question,
+            deadline=time.monotonic() + 60.0,
+            operation="visual_crop",
+        )
 
     def _visual_crop_sync(self, bid: str, question: str) -> dict[str, Any]:
         self._assert_thread()
@@ -1076,13 +1827,21 @@ class BrowserActor:
         self._visual_counter += 1
         locator.screenshot(path=str(path), timeout=30_000)
         self._capture_step("visual:element")
+        self._assert_publishable()
         evidence = self.evidence_store.add(
             "visual", self._page.url, f"局部视觉检查: {question}", {"path": str(path), "question": question, "analysis": None}
         )
         return {"path": str(path), "question": question, "evidence_id": evidence.evidence_id}
 
     async def render_document_page(self, path: str, page_number: int, question: str) -> dict[str, Any]:
-        return await self._call(self._render_document_page_sync, path, page_number, question)
+        return await self._call(
+            self._render_document_page_sync,
+            path,
+            page_number,
+            question,
+            deadline=time.monotonic() + 60.0,
+            operation="visual_document",
+        )
 
     def _render_document_page_sync(self, path: str, page_number: int, question: str) -> dict[str, Any]:
         self._assert_thread()
@@ -1123,6 +1882,7 @@ class BrowserActor:
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"PDF 页面渲染失败: {exc.stderr[:500]}") from exc
         output = output_prefix.with_suffix(".png")
+        self._assert_publishable()
         evidence = self.evidence_store.add(
             "visual",
             self._page.url,
@@ -1133,17 +1893,44 @@ class BrowserActor:
         return {"path": str(output), "question": question, "evidence_id": evidence.evidence_id}
 
     async def audit_step(self, label: str) -> str:
-        return await self._call(self._capture_step, label, label in {"finish", "record_coverage"})
+        return await self._call(
+            self._capture_step,
+            label,
+            label in {"finish", "record_coverage"},
+            deadline=time.monotonic() + 4.0,
+            operation="audit_step",
+        )
 
     def _element_state(self, locator: Any) -> dict[str, Any]:
         return locator.evaluate(
             "el => ({bid:el.getAttribute('bid'),tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.innerText||el.textContent||'').trim().slice(0,300),value:'value' in el?(el.type==='password'?'[REDACTED]':String(el.value||'')):'',checked:'checked' in el?Boolean(el.checked):null,selected:'selected' in el?Boolean(el.selected):null})"
         )
 
+    def _dispatch_mutation(self, operation: Callable[[], T]) -> T:
+        mutation_state = getattr(self._thread_context, "mutation_state", None)
+        deadline = getattr(self._thread_context, "deadline", None)
+        operation_name = str(getattr(self._thread_context, "operation", "action"))
+        generation, attempt = self._binding()
+        if mutation_state is not None and not mutation_state.begin(deadline):
+            raise ActorCallDeadlineExceeded(
+                operation_name,
+                dispatched=False,
+                task_generation=generation,
+                attempt=attempt,
+            )
+        dispatched_ms = time.time() * 1_000
+        with self._state_lock:
+            window = self._attempt_windows.get((generation, attempt))
+            if window is not None:
+                window["mutation_dispatched_ms"] = dispatched_ms
+        self._thread_context.mutation_dispatched = True
+        return operation()
+
     def _action_sync(self, action: str, operation: Callable[[], dict[str, Any]], bid: str | None) -> dict[str, Any]:
         self._assert_thread()
         self._action_counter += 1
         action_id = f"act-{self._action_counter:04d}"
+        task_generation, attempt = self._binding()
         try:
             self._ensure_live()
             before_url = self._page.url
@@ -1160,6 +1947,8 @@ class BrowserActor:
                 "",
                 {},
                 error=sanitize_exception(exc),
+                task_generation=task_generation,
+                attempt=attempt,
             )
             return receipt.to_dict()
         dialogs_before = len(self._dialogs)
@@ -1170,6 +1959,7 @@ class BrowserActor:
         postconditions: dict[str, Any] = {}
         settled_state: dict[str, Any] | None = None
         after_semantic = before_semantic
+        self._thread_context.mutation_dispatched = False
         try:
             postconditions.update(operation())
             settled_state = self._settle()
@@ -1184,6 +1974,10 @@ class BrowserActor:
             stale = "STALE_BID" in str(exc)
             error = sanitize_exception(exc)
             success = False
+            if bool(getattr(self._thread_context, "mutation_dispatched", False)):
+                reason = f"ACTOR_POISONED: {action} 异常且终态不确定"
+                self._mark_poisoned(task_generation, reason)
+                raise BrowserActorPoisonedError(reason) from exc
         try:
             after_url = self._page.url
             after_hash = before_hash
@@ -1207,6 +2001,10 @@ class BrowserActor:
             self._connected = False
             success = False
             error = error or sanitize_exception(exc)
+            if bool(getattr(self._thread_context, "mutation_dispatched", False)):
+                reason = f"ACTOR_POISONED: {action} 回执不完整且终态不确定"
+                self._mark_poisoned(task_generation, reason)
+                raise BrowserActorPoisonedError(reason) from exc
         postconditions.update(
             {
                 "bid": bid,
@@ -1232,6 +2030,7 @@ class BrowserActor:
                 },
             }
         )
+        self._assert_publishable(task_generation)
         public_postconditions = redact_value(postconditions)
         receipt_evidence = self.evidence_store.add(
             "receipt",
@@ -1251,6 +2050,8 @@ class BrowserActor:
             (receipt_evidence.evidence_id,),
             error,
             stale,
+            task_generation=task_generation,
+            attempt=attempt,
         )
         try:
             self._capture_step(action)
@@ -1282,13 +2083,25 @@ class BrowserActor:
         if self._closed:
             return
         try:
-            await self._call(self._close_sync)
+            await self._call(
+                self._close_sync,
+                deadline=time.monotonic() + 5.0,
+                operation="close",
+                allow_poisoned=True,
+            )
+        except (ActorCallDeadlineExceeded, BrowserActorPoisonedError):
+            pass
         finally:
             self._closed = True
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def flush_artifacts(self) -> None:
-        await self._call(self._flush_artifacts_sync)
+        await self._call(
+            self._flush_artifacts_sync,
+            deadline=time.monotonic() + 10.0,
+            operation="flush_artifacts",
+            allow_poisoned=True,
+        )
 
     def _flush_artifacts_sync(self) -> None:
         self._assert_thread()

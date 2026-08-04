@@ -200,7 +200,9 @@ bash scripts/run_agent.sh
 
 **并行机制：** `CDP_URLS` 的数量决定并行 worker 数，每个 worker 连接一个浏览器实例。
 
-**断点续跑：** 运行器会自动跳过已完成的任务（`result.json` 中 `"status": "SUCCESS"` 的任务），支持中断后安全重启。
+**断点续跑：** 普通续跑沿用匹配 run manifest 的 `run_id`；运行器仅跳过 fingerprint 与 `run_id` 均一致、`result.json` 中 `"status": "SUCCESS"` 且答案非空的任务。使用 `--force_rerun` 可生成新 `run_id` 并强制重跑。
+
+watchdog 能确认 Worker 已终止时写稳定失败 `result.json`；若进程拒绝 terminate/kill，父进程会写独占的 `watchdog_failure.json`。当前 run 的该标记优先于迟到 `result.json`，不会被静默复用。
 
 #### 任务格式
 

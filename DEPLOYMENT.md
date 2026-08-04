@@ -8,6 +8,7 @@
 - 所有浏览器连接与交互都经 Playwright，禁止裸 CDP 客户端、`cdp-use`、UI-TARS、AnySearch、外部搜索引擎及绕过网页的主动 HTTP/API 请求。
 - 每个 CDP URL 固定分配一个 BrowserActor worker。URL 数量必须为 1 到 8 且互不相同。
 - `max_steps` 外层配置限制在 1 到 100；实际采用基础 30 次模型请求加可证明进展信用，绝对不超过 60；模型单次请求上限为 180 秒。
+- 父进程按模型、工具和任务完成进度执行 Worker watchdog；默认连续 900 秒无进度即终止 Worker，并为未完成任务原子落盘稳定失败结果。若无法确认进程终止，则写父进程独占的 `watchdog_failure.json`，该标记优先于迟到 Worker 写入的 `result.json`。
 - 上传仅允许任务输出父目录或 `WEBRETRIEVER_UPLOAD_ROOTS` 白名单；Compose 默认只额外允许只读输入目录。
 - `output` 必须持久化；正式结果以各任务 `result.json.agent_answer` 和 CompletionVerifier 状态为准。
 
@@ -16,16 +17,12 @@
 ```bash
 cd /Users/admin/Desktop/webRetriever/WebDeepRetriever
 docker build -t webdeepretriever:protocol3 .
-docker run --rm webdeepretriever:protocol3 --healthcheck
+docker run --rm \
+  -e WEBRETRIEVER_CDP_URLS=http://host.docker.internal:9222 \
+  webdeepretriever:protocol3 --healthcheck --output /work/output
 ```
 
-预期输出：
-
-```json
-{"status": "ok", "playwright_transport": "cdp", "max_workers": 8}
-```
-
-这个健康检查验证 Python 包、运行入口和依赖可导入，不探测真实网站，也不把 CDP 可达性或模型可用性伪报为任务成功。
+这个 healthcheck 是 `--preflight` 的兼容别名：不请求模型、不导航目标网站，但会真实验证所有 CDP Worker 的 Browser/Context/Page、DOM/AX/CDP 能力一致性和输出目录可写性；失败返回非零状态与脱敏错误码。
 
 ## Docker Compose
 
@@ -99,11 +96,12 @@ cd /Users/admin/Desktop/webRetriever/WebDeepRetriever
 
 ## 输入输出契约
 
-输入是 Protocol III JSON 数组，每项使用 `task_idx`、`task_id`、`website`、`task`；离线评测数据另含标准 `answer`。运行器按 `<task_idx>_<task_id>/` 保存任务结果并支持跳过已有、含非空答案的 SUCCESS 结果。
+输入是 Protocol III JSON 数组，每项使用 `task_idx`、`task_id`、`website`、`task`；确需提交型表单确认时显式设置布尔字段 `requires_form_confirmation: true`，字段缺失默认 `false`。离线评测数据另含标准 `answer`。运行器按 `<task_idx>_<task_id>/` 保存任务结果；仅在 run manifest 与结果的 fingerprint、`run_id` 均一致时跳过已有、含非空答案的 SUCCESS 结果。
 
 输出卷需要保留：
 
 - `result.json` 及其 `agent_answer`、状态、证据绑定和 coverage；
+- `run_manifest.json`、`logs/preflight.json` 和 `logs/summary.json`；
 - `trajectory/`、`trajectory_visual/`、`capture.json`；
 - actions、thoughts、urls、动作回执、证据和 worker 日志。
 

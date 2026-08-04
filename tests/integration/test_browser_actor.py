@@ -13,8 +13,9 @@ from agents.tool_context import ToolContext
 from openai import AsyncOpenAI
 from PIL import Image
 
-from web_agent.browser_actor import BrowserActor
+from web_agent.browser_actor import BrowserActor, BrowserActorPoisonedError
 from web_agent.contracts import TaskContract
+from web_agent.preflight import run_preflight
 from web_agent.runtime import TaskRuntimeContext, observe as observe_tool
 from web_agent.verifier import CompletionVerifier
 
@@ -22,6 +23,24 @@ from conftest import one_element
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+async def test_real_cdp_preflight_without_navigation_or_model(
+    chrome_cdp_url: str,
+    tmp_path: Path,
+) -> None:
+    report = await asyncio.to_thread(run_preflight, [chrome_cdp_url], tmp_path / "preflight")
+    assert report["status"] == "ok"
+    assert report["model_requests"] == 0
+    assert report["target_navigation"] is False
+    assert report["workers"][0]["capabilities"] == {
+        "browser": True,
+        "context": True,
+        "page": True,
+        "dom": True,
+        "accessibility": True,
+        "cdp": True,
+    }
 
 
 async def test_large_dom_model_projection_repeat_and_full_audit(actor_factory: Any) -> None:
@@ -238,7 +257,14 @@ async def test_canvas_image_dialog_and_new_tab(actor_factory: Any) -> None:
     alert_receipt = await actor.click(alert["bid"])
     assert alert_receipt["success"]
     assert alert_receipt["postconditions"]["dialog_events"] == [
-        {"type": "alert", "message": "Proceed now", "action": "accept", "url": alert_receipt["before_url"]}
+        {
+            "type": "alert",
+            "message": "Proceed now",
+            "action": "accept",
+            "url": alert_receipt["before_url"],
+            "task_generation": alert_receipt["task_generation"],
+            "attempt": alert_receipt["attempt"],
+        }
     ]
 
     prompt = one_element(observation, tag="button", text="Show prompt")
@@ -385,13 +411,13 @@ async def test_page_crash_fails_fast_without_success_receipt(actor_factory: Any)
     observation = await actor.observe()
     field = one_element(observation, tag="input", name="thread-input")
 
-    await actor._call(actor._page._impl_obj.emit, "crash", None)
+    with pytest.raises(BrowserActorPoisonedError, match="PAGE_CRASHED"):
+        await actor._call(actor._page._impl_obj.emit, "crash", None)
     started = time.monotonic()
-    receipt = await actor.fill(field["bid"], "must-not-succeed")
+    with pytest.raises(BrowserActorPoisonedError, match="PAGE_CRASHED"):
+        await actor.fill(field["bid"], "must-not-succeed")
     elapsed = time.monotonic() - started
     assert elapsed < 2
-    assert receipt["success"] is False
-    assert receipt["error"]
 
 
 async def test_cdp_disconnect_fails_fast_without_success_receipt(actor_factory: Any) -> None:
@@ -399,13 +425,15 @@ async def test_cdp_disconnect_fails_fast_without_success_receipt(actor_factory: 
     observation = await actor.observe()
     field = one_element(observation, tag="input", name="thread-input")
 
-    await actor._call(actor._browser.close)
+    try:
+        await actor._call(actor._browser.close)
+    except BrowserActorPoisonedError:
+        pass
     started = time.monotonic()
-    receipt = await actor.fill(field["bid"], "must-not-succeed")
+    with pytest.raises(BrowserActorPoisonedError, match="(?:CDP_DISCONNECTED|PAGE_OR_CDP_UNAVAILABLE)"):
+        await actor.fill(field["bid"], "must-not-succeed")
     elapsed = time.monotonic() - started
     assert elapsed < 2
-    assert receipt["success"] is False
-    assert receipt["error"]
 
 
 async def test_volatile_clock_changes_raw_hash_but_not_semantic_state(actor_factory: Any) -> None:

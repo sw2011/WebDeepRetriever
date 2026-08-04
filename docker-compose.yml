@@ -13,6 +13,7 @@ services:
       MOONSHOT_TPM_SAFETY_RATIO: ${MOONSHOT_TPM_SAFETY_RATIO:-0.8}
       WEBRETRIEVER_CDP_URLS: ${WEBRETRIEVER_CDP_URLS:?请设置一个到八个逗号分隔的外部 CDP URL}
       WEBRETRIEVER_MAX_STEPS: ${WEBRETRIEVER_MAX_STEPS:-100}
+      WEBRETRIEVER_WORKER_WATCHDOG_SECONDS: ${WEBRETRIEVER_WORKER_WATCHDOG_SECONDS:-900}
       WEBRETRIEVER_UPLOAD_ROOTS: /work/input
     volumes:
       - type: bind
@@ -26,9 +27,9 @@ services:
       - "host.docker.internal:host-gateway"
     command: ["--input", "/work/input/tasks.json", "--output", "/work/output"]
     healthcheck:
-      test: ["CMD", "python", "-m", "web_agent.cli", "--healthcheck"]
+      test: ["CMD", "python", "-m", "web_agent.cli", "--healthcheck", "--output", "/work/output"]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 3
       start_period: 10s
     restart: "no"

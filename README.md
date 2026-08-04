@@ -143,6 +143,7 @@ cp .env.example .env
 | `MOONSHOT_TPM_SAFETY_RATIO` | 否 | `kimi-k2.6` 跨 Worker 预发送安全比例，默认 `0.8` |
 | `WEBRETRIEVER_CDP_URLS` | 是 | 1 到 8 个互不相同的 CDP URL，以英文逗号分隔 |
 | `WEBRETRIEVER_MAX_STEPS` | 否 | 外层单任务安全配置，允许 1 到 100；实际模型请求由自适应预算控制且不超过 60 |
+| `WEBRETRIEVER_WORKER_WATCHDOG_SECONDS` | 否 | Worker 无模型/工具/任务进度后的父进程超时，默认 `900` 秒 |
 | `WEBRETRIEVER_UPLOAD_ROOTS` | 否 | 允许上传的目录白名单 |
 | `WEBRETRIEVER_INPUT_HOST` | Compose 必填 | 宿主机任务 JSON 路径 |
 | `WEBRETRIEVER_OUTPUT_HOST` | 否 | Compose 宿主机输出目录，默认 `./output` |
@@ -174,19 +175,22 @@ export WEBRETRIEVER_CDP_URLS='http://127.0.0.1:9222'
 bash scripts/run_agent.sh
 ```
 
-并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。`kimi-k2.6` 的所有 Worker 共享同一滑动 TPM 窗口和按通道校准样本：冷启动按真实运行高分位保守预约，usage 返回后用实际输入 token 原子 reconcile；达到安全线时会在发送前等待，该等待不属于 API 重试，OpenAI 客户端仍保持 `max_retries=0`。重新运行时，仅跳过已有 `status == "SUCCESS"` 且答案非空的任务。
+并发数由 CDP URL 数量决定，上限为 8。Runner 会把待执行任务分片到独立进程；多个 Worker 复用同一 CDP URL 会直接报错。`kimi-k2.6` 的所有 Worker 共享同一滑动 TPM 窗口和按通道校准样本：冷启动按真实运行高分位保守预约，usage 返回后用实际输入 token 原子 reconcile；达到安全线时会在发送前等待，该等待不属于 API 重试，OpenAI 客户端仍保持 `max_retries=0`。
 
-健康检查只验证安装和入口，不探测浏览器、模型或网站：
+每次运行会原子写入 `run_manifest.json`，指纹覆盖数据集、Git/源码、模型/provider、Prompt、工具 Schema、Worker 数、`max_steps` 和 watchdog。普通续跑沿用匹配 manifest 的 `run_id`，且只复用 fingerprint、`run_id` 均一致、`SUCCESS` 且答案非空的结果；旧产物或损坏/缺失 manifest 不会静默复用。使用 `--force_rerun` 可生成新 `run_id` 并强制重跑。
+
+watchdog 能确认 Worker 已终止时会写稳定失败 `result.json`；若进程拒绝 terminate/kill，则父进程改写独占的 `watchdog_failure.json`，避免与迟到 Worker 竞争覆盖同一结果。匹配当前 run 的该标记优先于迟到 `result.json`，续跑不会将其当作成功复用。
+
+`--preflight` 会在零模型请求、零目标导航下检查所有 CDP Worker 的 Browser/Context/Page、DOM/AX/CDP 能力一致性及输出目录原子写入能力；`--healthcheck` 是兼容别名：
 
 ```bash
-.venv/bin/python -m web_agent.cli --healthcheck
+.venv/bin/python -m web_agent.cli \
+  --preflight \
+  --output output \
+  --cdp_url http://127.0.0.1:9222
 ```
 
-预期输出：
-
-```json
-{"status": "ok", "playwright_transport": "cdp", "max_workers": 8}
-```
+成功时返回 `status: "ok"`、`code: "PREFLIGHT_OK"` 和能力清单；失败时返回稳定错误码、脱敏诊断和非零退出状态。正常批任务启动前也会执行同一 preflight。
 
 ## Docker Compose 部署
 
@@ -213,7 +217,9 @@ macOS/Windows 的宿主机 CDP 通常填写 `http://host.docker.internal:9222`�
 
 ```bash
 docker build -t webdeepretriever:protocol3 .
-docker run --rm webdeepretriever:protocol3 --healthcheck
+docker run --rm \
+  -e WEBRETRIEVER_CDP_URLS=http://host.docker.internal:9222 \
+  webdeepretriever:protocol3 --healthcheck --output /work/output
 ```
 
 更多网络边界、直接运行容器和运维说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。
@@ -228,10 +234,13 @@ docker run --rm webdeepretriever:protocol3 --healthcheck
     "task_idx": 0,
     "task_id": "example-task-id",
     "website": "https://example.com",
-    "task": "读取页面中的目标信息并返回答案"
+    "task": "读取页面中的目标信息并返回答案",
+    "requires_form_confirmation": false
   }
 ]
 ```
+
+`requires_form_confirmation` 只接受显式布尔值；字段缺失默认 `false`。只有任务确实要求提交、发送、创建等副作用并需要确认回执时才设为 `true`，不会从任务自然语言关键词推断。
 
 Runner 使用 `<task_idx>_<task_id>` 作为任务目录名，因此生成后的目录名必须唯一。当前代码不会清理标识符，输入方还必须确保 `task_idx` 和 `task_id` 不包含 `/`、`\`、`..` 等路径片段。仓库中的 [data/example_tasks.json](data/example_tasks.json) 可直接作为结构参考；其中任务会访问真实网站，运行前仍需确认访问权限、登录状态和模型额度。完整任务数据需要按实际运行环境准备。
 

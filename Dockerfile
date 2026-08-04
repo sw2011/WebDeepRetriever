@@ -26,8 +26,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 
 USER webagent
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD ["python", "-m", "web_agent.cli", "--healthcheck"]
+HEALTHCHECK --interval=30s --timeout=30s --start-period=10s --retries=3 \
+    CMD ["python", "-m", "web_agent.cli", "--healthcheck", "--output", "/work/output"]
 
 ENTRYPOINT ["python", "-m", "web_agent.cli"]
-CMD ["--healthcheck"]
+CMD ["--healthcheck", "--output", "/work/output"]

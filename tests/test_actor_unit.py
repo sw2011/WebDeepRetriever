@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from web_agent.browser_actor import (
+    ActorCallDeadlineExceeded,
     BrowserActor,
+    BrowserActorPoisonedError,
+    _CallDispatchState,
     _redact,
     _safe_post_data,
     _sanitize_headers,
@@ -54,6 +58,15 @@ def test_sensitive_network_material_is_removed() -> None:
         "org-privatevalue proj-privatevalue ak-private-private"
     )
     assert "private" not in sanitized_error
+    websocket_error = sanitize_error_text(
+        "connect ws://user:password@127.0.0.1:9222/devtools?access_token=private"
+    )
+    assert "user" not in websocket_error
+    assert "password" not in websocket_error
+    assert "private" not in websocket_error
+    path_secret = sanitize_url("wss://cdp.test/access_token=supersecret123/api_key=anothersecret123")
+    assert "supersecret123" not in path_secret
+    assert "anothersecret123" not in path_secret
 
 
 def test_binary_post_data_is_fingerprinted_without_decoding() -> None:
@@ -104,7 +117,13 @@ async def test_response_capture_errors_do_not_escape_event_listener(tmp_path) ->
             raise RuntimeError("target closed")
 
     await actor._call(actor._on_response, BrokenResponse())
-    assert actor._network_records == [{"capture_error": "RuntimeError"}]
+    assert actor._network_records == [
+        {
+            "capture_error": "RuntimeError",
+            "task_generation": 0,
+            "attempt": 1,
+        }
+    ]
     tmp_path.mkdir(exist_ok=True)
     await actor.close()
 
@@ -430,5 +449,543 @@ def test_screenshot_hardlink_falls_back_to_copy(tmp_path, monkeypatch) -> None:
     path = actor._capture_step("test", force=True)
     assert (tmp_path / "trajectory_visual" / "000.png").read_bytes() == b"png"
     assert path.endswith("trajectory/000.png")
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_deadline_before_dispatch_is_safe_and_actor_remains_usable(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    started = threading.Event()
+    release = threading.Event()
+
+    def occupy_owner_thread() -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "released"
+
+    first = asyncio.create_task(actor._call(occupy_owner_thread))
+    assert await asyncio.to_thread(started.wait, 1)
+    with pytest.raises(ActorCallDeadlineExceeded) as caught:
+        await actor._call(lambda: "must-not-run", deadline=time.monotonic() + 0.02, operation="queued")
+    assert caught.value.dispatched is False
+    assert actor.poisoned is False
+    release.set()
+    assert await first == "released"
+    assert await actor._call(lambda: "still-usable") == "still-usable"
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_precondition_never_dispatches_mutation(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    precondition_started = threading.Event()
+    release_precondition = threading.Event()
+    finished = threading.Event()
+    click_count = 0
+
+    class Locator:
+        def click(self, timeout: int) -> None:  # noqa: ARG002
+            nonlocal click_count
+            click_count += 1
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._connected = True
+    actor._ensure_live = lambda: None  # type: ignore[method-assign]
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: {  # type: ignore[method-assign]
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+
+    def blocked_element_state(locator):  # noqa: ANN001, ARG001
+        precondition_started.set()
+        release_precondition.wait(timeout=2)
+        return {"type": "button", "text": "go"}
+
+    actor._element_state = blocked_element_state  # type: ignore[method-assign]
+
+    def invoke() -> dict:
+        try:
+            return actor._action_sync("click", lambda: actor._click_op("abc"), "abc")
+        finally:
+            finished.set()
+
+    call = asyncio.create_task(
+        actor._call(
+            invoke,
+            deadline=time.monotonic() + 0.2,
+            operation="click",
+            mutation_aware=True,
+        )
+    )
+    assert await asyncio.to_thread(precondition_started.wait, 1)
+    with pytest.raises(ActorCallDeadlineExceeded) as caught:
+        await call
+    assert caught.value.dispatched is False
+    assert actor.poisoned is False
+    release_precondition.set()
+    assert await asyncio.to_thread(finished.wait, 1)
+    assert click_count == 0
+    assert await actor._call(lambda: "still-usable") == "still-usable"
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_begin_task_waits_for_old_action_before_switching_generation(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    action_started = threading.Event()
+    release_action = threading.Event()
+    mutation_generations: list[int] = []
+    old_generation = actor.task_generation
+
+    def old_action() -> str:
+        action_started.set()
+        release_action.wait(timeout=2)
+        return actor._dispatch_mutation(
+            lambda: mutation_generations.append(actor.task_generation) or "done"
+        )
+
+    actor._begin_task_sync = lambda initial_url, output_dir, store: {  # type: ignore[method-assign]
+        "url": initial_url,
+        "connected": True,
+    }
+    action = asyncio.create_task(
+        actor._call(old_action, operation="click", mutation_aware=True)
+    )
+    assert await asyncio.to_thread(action_started.wait, 1)
+    transition = asyncio.create_task(
+        actor.begin_task("https://new.test", tmp_path / "new", EvidenceStore())
+    )
+    await asyncio.sleep(0)
+
+    assert actor.task_generation == old_generation
+    with pytest.raises(BrowserActorPoisonedError, match="任务切换期间"):
+        await actor._call(lambda: "old task must not queue")
+
+    release_action.set()
+    assert await action == "done"
+    result = await transition
+    assert mutation_generations == [old_generation]
+    assert result["task_generation"] == old_generation + 1
+    assert actor.task_generation == old_generation + 1
+    await actor.close()
+
+
+def test_dispatch_cancellation_and_worker_start_are_atomic() -> None:
+    state = _CallDispatchState()
+    assert state.cancel_if_queued() is True
+    assert state.begin(time.monotonic() + 1) is False
+
+
+def test_poison_and_evidence_publication_share_one_commit_boundary(tmp_path) -> None:
+    store = EvidenceStore()
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, store)
+    actor._mark_poisoned(actor.task_generation, "ACTOR_POISONED: test")
+
+    with pytest.raises(BrowserActorPoisonedError, match="ACTOR_POISONED"):
+        store.add("dom", "https://example.test", "late", {"value": 1})
+
+    assert store.values() == []
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_timed_out_attempt_rolls_back_evidence_written_before_tail_block(tmp_path) -> None:
+    store = EvidenceStore()
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, store)
+    evidence_added = threading.Event()
+    release = threading.Event()
+
+    def write_then_block() -> None:
+        store.add("dom", "https://example.test", "temporary", {"data": "late"})
+        evidence_added.set()
+        release.wait(timeout=2)
+
+    call = asyncio.create_task(
+        actor._call(
+            write_then_block,
+            deadline=time.monotonic() + 0.1,
+            operation="observe",
+        )
+    )
+    assert await asyncio.to_thread(evidence_added.wait, 1)
+    with pytest.raises(ActorCallDeadlineExceeded):
+        await call
+    assert store.values() == []
+    release.set()
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+def test_old_evidence_store_is_rejected_after_generation_switch(tmp_path) -> None:
+    old_store = EvidenceStore()
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, old_store)
+    first_generation = actor._reserve_generation()
+    actor._bind_evidence_store(old_store, first_generation)
+    new_store = EvidenceStore()
+    second_generation = actor._reserve_generation()
+    actor._bind_evidence_store(new_store, second_generation)
+
+    with pytest.raises(BrowserActorPoisonedError, match="STALE_TASK_GENERATION"):
+        old_store.add("dom", "https://example.test", "old", {"data": 1})
+    current = new_store.add("dom", "https://example.test", "new", {"data": 2})
+
+    assert old_store.values() == []
+    assert current.payload["task_generation"] == second_generation
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.parametrize("action", ["accept", "dismiss"])
+def test_dialog_resolution_failure_poisons_actor(tmp_path, action: str) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    actor._page = SimpleNamespace(url="https://example.test")
+    actor._next_dialog_action = (action, None, actor.task_generation)
+
+    class Dialog:
+        type = "confirm"
+        message = "continue?"
+
+        def accept(self, prompt_text=None) -> None:  # noqa: ANN001, ARG002
+            raise RuntimeError("accept failed")
+
+        def dismiss(self) -> None:
+            raise RuntimeError("dismiss failed")
+
+    with pytest.raises(BrowserActorPoisonedError, match=f"dialog {action}"):
+        actor._on_dialog(Dialog(), actor.task_generation)
+
+    assert actor.poisoned is True
+    assert actor._dialogs[0]["error"] == "RuntimeError"
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_begin_task_clears_unconsumed_dialog_arm(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    old_generation = actor.task_generation
+    actor._next_dialog_action = ("accept", "stale secret", old_generation)
+    generation = actor._reserve_generation()
+    actor._owner_thread = threading.get_ident()
+    actor._playwright = object()
+    actor._context = None
+    actor._prepare_task = lambda initial_url: {"url": initial_url}  # type: ignore[method-assign]
+
+    actor._begin_task_sync("https://example.test", tmp_path, EvidenceStore())
+
+    assert actor._next_dialog_action == ("dismiss", None, generation)
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_late_pdf_response_cannot_satisfy_next_download_attempt(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    (tmp_path / "downloads").mkdir()
+    actor._owner_thread = threading.get_ident()
+    actor._thread_context.generation = actor.task_generation
+    actor._thread_context.attempt = 2
+    base_ms = time.time() * 1_000 - 1_000
+    actor._attempt_windows[(actor.task_generation, 1)] = {
+        "started_ms": base_ms,
+        "ended_ms": base_ms + 500,
+        "mutation_dispatched_ms": base_ms + 100,
+    }
+    actor._attempt_windows[(actor.task_generation, 2)] = {
+        "started_ms": base_ms + 800,
+        "ended_ms": None,
+        "mutation_dispatched_ms": None,
+    }
+
+    request = SimpleNamespace(
+        resource_type="document",
+        timing={"startTime": base_ms + 200},
+        url="https://old.test/stale.pdf",
+        redirected_from=None,
+        is_navigation_request=lambda: True,
+    )
+    response = SimpleNamespace(
+        headers={"content-type": "application/pdf"},
+        request=request,
+        url="https://old.test/stale.pdf",
+    )
+
+    class ExpectDownload:
+        def __enter__(self):
+            return SimpleNamespace()
+
+        def __exit__(self, exc_type, exc, traceback):  # noqa: ANN001, ARG002
+            raise PlaywrightTimeoutError("no download")
+
+    class Locator:
+        def get_attribute(self, name: str) -> str | None:
+            return "/wanted.pdf" if name == "href" else None
+
+        def click(self, timeout: int) -> None:  # noqa: ARG002
+            actor._capture_response(response, actor.task_generation)
+
+    actor._page = SimpleNamespace(
+        url="https://current.test/page",
+        expect_download=lambda timeout: ExpectDownload(),
+    )
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="既未触发下载"):
+        actor._download_op("pdf")
+
+    assert actor._pdf_responses[0]["attempt"] == 1
+    assert list((tmp_path / "downloads").iterdir()) == []
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_current_non_navigation_pdf_matching_link_can_satisfy_download_fallback(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    (tmp_path / "downloads").mkdir()
+    actor._owner_thread = threading.get_ident()
+    actor._thread_context.generation = actor.task_generation
+    actor._thread_context.attempt = 1
+    actor._attempt_windows[(actor.task_generation, 1)] = {
+        "started_ms": time.time() * 1_000 - 100,
+        "ended_ms": None,
+        "mutation_dispatched_ms": None,
+    }
+
+    class Request:
+        resource_type = "document"
+        url = "chrome-extension://pdf-viewer/stream-id"
+        redirected_from = None
+        frame = SimpleNamespace(url="https://example.test/current.pdf")
+
+        @property
+        def timing(self) -> dict[str, float]:
+            return {"startTime": time.time() * 1_000}
+
+        def is_navigation_request(self) -> bool:
+            return False
+
+    response = SimpleNamespace(
+        headers={"content-type": "application/pdf"},
+        request=Request(),
+        url="chrome-extension://pdf-viewer/stream-id",
+        body=lambda: b"%PDF-current",
+    )
+
+    class ExpectDownload:
+        def __enter__(self):
+            return SimpleNamespace()
+
+        def __exit__(self, exc_type, exc, traceback):  # noqa: ANN001, ARG002
+            raise PlaywrightTimeoutError("inline PDF")
+
+    class Locator:
+        def get_attribute(self, name: str) -> str | None:
+            return "/current.pdf" if name == "href" else None
+
+        def click(self, timeout: int) -> None:  # noqa: ARG002
+            actor._capture_response(response, actor.task_generation)
+
+    actor._page = SimpleNamespace(
+        url="https://example.test/page",
+        expect_download=lambda timeout: ExpectDownload(),
+    )
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+
+    result = actor._download_op("pdf")
+
+    assert result["download"]["inline_pdf"] is True
+    assert (tmp_path / "downloads" / "current.pdf").read_bytes() == b"%PDF-current"
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_unrelated_non_navigation_pdf_cannot_satisfy_download_fallback(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    (tmp_path / "downloads").mkdir()
+    actor._owner_thread = threading.get_ident()
+    actor._thread_context.generation = actor.task_generation
+    actor._thread_context.attempt = 1
+    actor._attempt_windows[(actor.task_generation, 1)] = {
+        "started_ms": time.time() * 1_000 - 100,
+        "ended_ms": None,
+        "mutation_dispatched_ms": None,
+    }
+    request = SimpleNamespace(
+        resource_type="document",
+        timing={"startTime": time.time() * 1_000},
+        url="https://example.test/unrelated.pdf",
+        redirected_from=None,
+        is_navigation_request=lambda: False,
+    )
+    response = SimpleNamespace(
+        headers={"content-type": "application/pdf"},
+        request=request,
+        url=request.url,
+        body=lambda: b"%PDF-unrelated",
+    )
+
+    class ExpectDownload:
+        def __enter__(self):
+            return SimpleNamespace()
+
+        def __exit__(self, exc_type, exc, traceback):  # noqa: ANN001, ARG002
+            raise PlaywrightTimeoutError("no download")
+
+    class Locator:
+        def get_attribute(self, name: str) -> str | None:
+            return "/expected.pdf" if name == "href" else None
+
+        def click(self, timeout: int) -> None:  # noqa: ARG002
+            actor._capture_response(response, actor.task_generation)
+
+    actor._page = SimpleNamespace(
+        url="https://example.test/page",
+        expect_download=lambda timeout: ExpectDownload(),
+    )
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="既未触发下载"):
+        actor._download_op("pdf")
+
+    assert list((tmp_path / "downloads").iterdir()) == []
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_internal_failure_after_mutation_dispatch_poisons_actor(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    actor._owner_thread = threading.get_ident()
+    actor._connected = True
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._semantic_page_state = lambda: {  # type: ignore[method-assign]
+        "url": page.url,
+        "title": "before",
+        "semantic_page_fingerprint": "before-state",
+        "semantic_element_count": 1,
+    }
+
+    def fail_after_dispatch() -> dict:
+        return actor._dispatch_mutation(lambda: (_ for _ in ()).throw(TimeoutError("uncertain")))
+
+    with pytest.raises(BrowserActorPoisonedError, match="终态不确定"):
+        actor._action_sync("click", fail_after_dispatch, None)
+    assert actor.poisoned is True
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_timeout_poisons_actor_and_drops_late_event(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    finished = threading.Event()
+
+    class BrokenResponse:
+        @property
+        def headers(self):
+            raise RuntimeError("late response")
+
+    def dispatched_then_late() -> str:
+        time.sleep(0.08)
+        actor._on_response(BrokenResponse())
+        finished.set()
+        return "side effect may have happened"
+
+    with pytest.raises(ActorCallDeadlineExceeded) as caught:
+        await actor._call(
+            dispatched_then_late,
+            deadline=time.monotonic() + 0.02,
+            operation="click",
+        )
+    assert caught.value.dispatched is True
+    assert actor.poisoned is True
+    assert await asyncio.to_thread(finished.wait, 1)
+    assert actor._network_records == []
+    with pytest.raises(BrowserActorPoisonedError, match="ACTOR_POISONED"):
+        await actor._call(lambda: "must-not-run")
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_after_dispatch_also_poisons_actor(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking_action() -> None:
+        started.set()
+        release.wait(timeout=1)
+
+    call = asyncio.create_task(actor._call(blocking_action, operation="upload"))
+    assert await asyncio.to_thread(started.wait, 1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert actor.poisoned is True
+    release.set()
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_old_generation_event_is_ignored_after_task_switch(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    old_generation = actor.task_generation
+    new_generation = actor._reserve_generation()
+    assert new_generation != old_generation
+
+    class BrokenResponse:
+        @property
+        def headers(self):
+            raise RuntimeError("old task response")
+
+    await actor._call(actor._on_response, BrokenResponse(), old_generation)
+    assert actor._network_records == []
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_actor_evidence_is_bound_to_generation_and_attempt(tmp_path) -> None:
+    store = EvidenceStore()
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, store)
+
+    def add_evidence():
+        return store.add("dom", "https://example.test", "bound", {"value": 1})
+
+    evidence = await actor._call(add_evidence)
+    assert evidence.payload["task_generation"] == actor.task_generation
+    assert evidence.payload["attempt"] == 1
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.parametrize("event", ["crash", "disconnect"])
+def test_page_crash_and_cdp_disconnect_poison_actor(tmp_path, event: str) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    generation = actor.task_generation
+    if event == "crash":
+        actor._on_page_crash(generation)
+        assert "PAGE_CRASHED" in (actor.poisoned_reason or "")
+    else:
+        actor._connected = True
+        actor._on_disconnected(generation)
+        assert "CDP_DISCONNECTED" in (actor.poisoned_reason or "")
+    assert actor.poisoned is True
     actor._closed = True
     actor._executor.shutdown(wait=True, cancel_futures=True)

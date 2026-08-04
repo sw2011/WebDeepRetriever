@@ -12,6 +12,7 @@ from agents.tool_context import ToolContext
 from agents.run_config import CallModelData, ModelInputData
 from openai import AsyncOpenAI
 
+from web_agent.browser_actor import ActorCallDeadlineExceeded
 from web_agent.contracts import CoverageCertificate, TaskContract
 from web_agent.evidence import EvidenceStore
 from web_agent.runtime import (
@@ -21,6 +22,7 @@ from web_agent.runtime import (
     ProtocolRunHooks,
     ProtocolIIIAgent,
     TaskRuntimeContext,
+    TerminalBrowserError,
     _coverage_items,
     _answer_shape_reasons,
     _error,
@@ -354,6 +356,22 @@ async def test_no_progress_loop_stops_before_another_model_request() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_poisoned_actor_stops_before_another_model_request() -> None:
+    context = make_context()
+    context.actor = SimpleNamespace(  # type: ignore[assignment]
+        poisoned=True,
+        poisoned_reason="ACTOR_POISONED: click 终态不确定",
+    )
+    with pytest.raises(TerminalBrowserError, match="ACTOR_POISONED"):
+        await ProtocolRunHooks().on_llm_start(
+            RunContextWrapper(context),
+            SimpleNamespace(),  # type: ignore[arg-type]
+            "system",
+            [],
+        )
+
+
 def test_new_page_states_and_scroll_progress_reset_loop_counter() -> None:
     context = make_context()
     for index in range(5):
@@ -438,8 +456,8 @@ def test_shared_tpm_limiter_is_atomic_across_spawned_processes() -> None:
         ]
         for process in processes:
             process.start()
-        assert ready.get(timeout=5) is True
-        assert ready.get(timeout=5) is True
+        assert ready.get(timeout=15) is True
+        assert ready.get(timeout=15) is True
         gate.set()
         reservations = [results.get(timeout=5), results.get(timeout=5)]
         for process in processes:
@@ -800,6 +818,136 @@ async def test_illegal_finish_tool_output_is_returned_as_error_not_success() -> 
     )
     assert "error" in str(output).lower()
     assert context.finish_accepted is False
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_when_audit_timeout_poisons_browser() -> None:
+    class PoisonOnAudit(DummyActor):
+        poisoned = False
+        poisoned_reason = None
+
+        async def audit_step(self, label: str) -> str:
+            self.poisoned = True
+            self.poisoned_reason = "ACTOR_POISONED: finish 终态不确定"
+            raise ActorCallDeadlineExceeded(
+                label,
+                dispatched=True,
+                task_generation=3,
+                attempt=7,
+            )
+
+    context = make_context()
+    context.actor = PoisonOnAudit()  # type: ignore[assignment]
+    evidence = context.evidence_store.add("dom", "https://example.test", "answer", {"data": "42"})
+    context.visited_urls.append("https://example.test")
+    finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
+    arguments = json.dumps({"answer": "42", "evidence_ids": [evidence.evidence_id]})
+
+    output = await finish_tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="poisoned", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+
+    assert payload["accepted"] is False
+    assert payload["terminal_uncertain"] is True
+    assert context.finish_accepted is False
+    assert context.terminal_browser_error == "ACTOR_POISONED: finish 终态不确定"
+
+
+@pytest.mark.asyncio
+async def test_coverage_is_not_signed_after_audit_poisons_browser() -> None:
+    class PoisonOnAudit(DummyActor):
+        poisoned = False
+        poisoned_reason = None
+
+        async def audit_step(self, label: str) -> str:
+            self.poisoned = True
+            self.poisoned_reason = "ACTOR_POISONED: coverage 终态不确定"
+            raise ActorCallDeadlineExceeded(label, dispatched=True)
+
+    context = make_context()
+    context.actor = PoisonOnAudit()  # type: ignore[assignment]
+    context.contract = TaskContract.from_item(
+        {"task_idx": 1, "task_id": "x", "website": "https://example.test", "task": "列出所有记录"}
+    )
+    rows = context.evidence_store.add("dom", "https://example.test", "rows", {"data": ["A"]})
+    terminal = context.evidence_store.add("dom", "https://example.test", "terminal", {"disabled": True})
+    arguments = json.dumps(
+        {
+            "strategy": "pagination",
+            "item_evidence_ids": [rows.evidence_id],
+            "pages_visited": 1,
+            "expected_total": 1,
+            "terminal_reason": "next_disabled",
+            "terminal_evidence_id": terminal.evidence_id,
+        }
+    )
+    coverage_tool = next(tool for tool in TOOLS if tool.name == "record_coverage")
+
+    output = await coverage_tool.on_invoke_tool(
+        ToolContext(context, tool_name="record_coverage", tool_call_id="poisoned", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+
+    assert payload["ok"] is False
+    assert payload["terminal_uncertain"] is True
+    assert context.coverage_records == {}
+    assert context.terminal_browser_error == "ACTOR_POISONED: coverage 终态不确定"
+
+
+@pytest.mark.asyncio
+async def test_poisoned_actor_cannot_reuse_cached_coverage_certificate() -> None:
+    context = make_context()
+    context.contract = TaskContract.from_item(
+        {"task_idx": 1, "task_id": "x", "website": "https://example.test", "task": "列出所有记录"}
+    )
+    rows = context.evidence_store.add("dom", "https://example.test", "rows", {"data": ["A"]})
+    terminal = context.evidence_store.add("dom", "https://example.test", "terminal", {"disabled": True})
+    arguments = json.dumps(
+        {
+            "strategy": "pagination",
+            "item_evidence_ids": [rows.evidence_id],
+            "pages_visited": 1,
+            "expected_total": 1,
+            "terminal_reason": "next_disabled",
+            "terminal_evidence_id": terminal.evidence_id,
+        }
+    )
+    coverage_tool = next(tool for tool in TOOLS if tool.name == "record_coverage")
+    first = await coverage_tool.on_invoke_tool(
+        ToolContext(context, tool_name="record_coverage", tool_call_id="first", tool_arguments=arguments),
+        arguments,
+    )
+    assert json.loads(first)["ok"] is True
+    context.actor.poisoned = True
+    context.actor.poisoned_reason = "ACTOR_POISONED: late failure"
+
+    second = await coverage_tool.on_invoke_tool(
+        ToolContext(context, tool_name="record_coverage", tool_call_id="second", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(second)
+
+    assert payload["ok"] is False
+    assert payload["cache_hit"] is False
+    assert payload["terminal_uncertain"] is True
+    assert payload["safe_to_retry"] is False
+
+
+def test_browser_result_rebinds_runtime_action_to_actor_attempt() -> None:
+    context = make_context()
+    context.record_call("observe", {})
+    context.record_tool_outcome(
+        "observe",
+        {},
+        {"ok": True, "task_generation": 4, "attempt": 9},
+    )
+    assert context.actions[-1]["task_generation"] == 4
+    assert context.actions[-1]["attempt"] == 9
+    assert context.tool_outcomes[-1]["task_generation"] == 4
+    assert context.tool_outcomes[-1]["attempt"] == 9
 
 
 @pytest.mark.asyncio

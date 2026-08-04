@@ -16,7 +16,7 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
 _JWT_VALUE = re.compile(r"\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b")
 _PREFIXED_KEY = re.compile(r"\b(?:sk|ak|org|proj)-[a-zA-Z0-9_-]{8,}\b", re.I)
-_URL = re.compile(r"https?://[^\s<>'\"]+")
+_URL = re.compile(r"(?:https?|wss?)://[^\s<>'\"]+")
 
 
 def redact_text(value: str) -> str:
@@ -44,7 +44,7 @@ def sanitize_url(value: str) -> str:
             ],
             doseq=True,
         )
-        return urlunsplit((parsed.scheme, netloc, parsed.path, query, redact_text(parsed.fragment)))
+        return urlunsplit((parsed.scheme, netloc, redact_text(parsed.path), query, redact_text(parsed.fragment)))
     except (TypeError, ValueError):
         return redact_text(str(value))
 

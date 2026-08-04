@@ -10,7 +10,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from agents import (
     Agent,
@@ -30,7 +30,12 @@ from agents.run_config import CallModelData, ModelInputData
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
-from .browser_actor import BrowserActor, canonical_url
+from .browser_actor import (
+    ActorCallDeadlineExceeded,
+    BrowserActor,
+    BrowserActorPoisonedError,
+    canonical_url,
+)
 from .contracts import ActionReceipt, CoverageCertificate, TaskContract
 from .evidence import EvidenceStore
 from .sanitization import redact_value, sanitize_exception, sanitize_url
@@ -62,6 +67,7 @@ SYSTEM_INSTRUCTIONS = """你是 WebRetriever Protocol III 的网页任务执行 
 11. 历史摘要中的结构化证据如需尾部或完整分块，使用 recall_evidence 按 evidence_id 和 offset 回读，不要重复抓取页面。
 12. 同页需要多种文本/列表/表格/链接时优先一次 extract_many（最多 8 项）；cache_hit=true 表示没有新信息，不要重复调用。
 13. finish 前只回答被问值或列表；数值、单位、前 N/全部条目数必须与绑定证据和 coverage 摘要一致，不得用解释性长答案掩盖缺项。
+14. 工具返回 terminal_uncertain=true 或 ACTOR_POISONED 时，动作终态不确定且浏览器不可继续；不得重试该动作。
 """
 
 
@@ -385,6 +391,8 @@ class TaskRuntimeContext:
     repeated_no_info: dict[str, int] = field(default_factory=dict)
     repeat_count: int = 0
     cycle_count: int = 0
+    terminal_browser_error: str | None = None
+    progress_callback: Callable[[str], None] | None = None
 
     @property
     def hard_step_limit(self) -> int:
@@ -412,6 +420,8 @@ class TaskRuntimeContext:
         self.actions.append(
             {
                 "step": self.tool_steps,
+                "task_generation": int(getattr(self.actor, "task_generation", 0)),
+                "attempt": self.tool_steps,
                 "tool": name,
                 "arguments": redact_value(arguments),
                 "signature": self._signature(name, arguments),
@@ -432,6 +442,8 @@ class TaskRuntimeContext:
             error=result.get("error"),
             stale_bid=result.get("stale_bid", False),
             created_at=result.get("created_at", ""),
+            task_generation=int(result.get("task_generation", 0)),
+            attempt=int(result.get("attempt", 0)),
         )
         self.receipts.append(receipt)
         if result.get("after_url"):
@@ -461,6 +473,17 @@ class TaskRuntimeContext:
         tool_latency_ms: float = 0.0,
         browser_latency_ms: float = 0.0,
     ) -> dict[str, Any]:
+        result_generation = result.get("task_generation")
+        result_attempt = result.get("attempt")
+        task_generation = (
+            int(result_generation)
+            if result_generation is not None
+            else int(getattr(self.actor, "task_generation", 0))
+        )
+        attempt = int(result_attempt) if result_attempt is not None else self.tool_steps
+        if self.actions and self.actions[-1].get("step") == self.tool_steps:
+            self.actions[-1]["task_generation"] = task_generation
+            self.actions[-1]["attempt"] = attempt
         signature = self._signature(name, arguments)
         state_before = (self.current_url, self.current_semantic_fingerprint)
         reasons: list[str] = []
@@ -571,6 +594,8 @@ class TaskRuntimeContext:
             )[:1_200]
         outcome = {
             "step": self.tool_steps,
+            "task_generation": task_generation,
+            "attempt": attempt,
             "tool": name,
             "signature": signature,
             "success": success,
@@ -714,6 +739,18 @@ class NoProgressLoopError(RuntimeError):
     pass
 
 
+class TerminalBrowserError(RuntimeError):
+    pass
+
+
+def _actor_poisoned(context: TaskRuntimeContext) -> bool:
+    return bool(getattr(context.actor, "poisoned", False))
+
+
+def _actor_poisoned_reason(context: TaskRuntimeContext) -> str:
+    return str(getattr(context.actor, "poisoned_reason", None) or "ACTOR_POISONED")
+
+
 class ProtocolRunHooks(RunHooksBase[TaskRuntimeContext, Agent[TaskRuntimeContext]]):
     async def on_llm_start(
         self,
@@ -724,6 +761,13 @@ class ProtocolRunHooks(RunHooksBase[TaskRuntimeContext, Agent[TaskRuntimeContext
     ) -> None:
         if context.context.usage_stats is not None:
             context.context.usage_stats.set_runtime_snapshot(context.context.telemetry_snapshot())
+        if context.context.progress_callback is not None:
+            context.context.progress_callback("model_start")
+        if context.context.terminal_browser_error or _actor_poisoned(context.context):
+            raise TerminalBrowserError(
+                context.context.terminal_browser_error
+                or _actor_poisoned_reason(context.context)
+            )
         context.context.assert_model_budget()
         if context.context.loop_detected:
             raise NoProgressLoopError(context.context.loop_reason or "NO_PROGRESS_LOOP")
@@ -965,6 +1009,8 @@ def _finish_tool_result(
     cache_hit: bool = False,
     browser_call: bool = False,
 ) -> dict[str, Any]:
+    if browser_call and _actor_poisoned(context):
+        context.terminal_browser_error = _actor_poisoned_reason(context)
     elapsed_ms = (time.monotonic() - started) * 1_000
     outcome = context.record_tool_outcome(
         name,
@@ -974,6 +1020,8 @@ def _finish_tool_result(
         tool_latency_ms=elapsed_ms,
         browser_latency_ms=elapsed_ms if browser_call else 0.0,
     )
+    if context.progress_callback is not None:
+        context.progress_callback(f"tool_complete:{name}")
     decorated = {
         **result,
         "progressed": outcome["progressed"],
@@ -988,7 +1036,30 @@ def _finish_tool_result(
 
 
 def _tool_exception_result(name: str, exc: Exception) -> dict[str, Any]:
-    return {"ok": False, "tool": name, "error": sanitize_exception(exc)}
+    result: dict[str, Any] = {"ok": False, "tool": name, "error": sanitize_exception(exc)}
+    if isinstance(exc, ActorCallDeadlineExceeded):
+        result.update(
+            {
+                "dispatched": exc.dispatched,
+                "terminal_uncertain": exc.dispatched,
+                "safe_to_retry": not exc.dispatched,
+                "task_generation": exc.task_generation,
+                "attempt": exc.attempt,
+            }
+        )
+    elif isinstance(exc, BrowserActorPoisonedError):
+        result.update({"terminal_uncertain": True, "safe_to_retry": False})
+    return result
+
+
+def _audit_terminal_reason(context: TaskRuntimeContext, exc: Exception | None = None) -> str | None:
+    if _actor_poisoned(context):
+        return _actor_poisoned_reason(context)
+    if isinstance(exc, ActorCallDeadlineExceeded) and exc.dispatched:
+        return sanitize_exception(exc)
+    if isinstance(exc, BrowserActorPoisonedError):
+        return sanitize_exception(exc)
+    return None
 
 
 def _tool_failure(ctx: RunContextWrapper[TaskRuntimeContext], error: Exception) -> str:
@@ -1002,6 +1073,8 @@ def _tool_failure(ctx: RunContextWrapper[TaskRuntimeContext], error: Exception) 
     except (json.JSONDecodeError, TypeError):
         arguments = {"invalid_arguments": True}
     context = ctx.context
+    if _actor_poisoned(context):
+        context.terminal_browser_error = _actor_poisoned_reason(context)
     started = time.monotonic()
     try:
         pending_started_call = bool(
@@ -1688,6 +1761,25 @@ async def record_coverage(
         None,
     )
     if existing_id is not None:
+        terminal_reason = _audit_terminal_reason(ctx.context)
+        if terminal_reason is not None:
+            ctx.context.terminal_browser_error = terminal_reason
+            result = {
+                "ok": False,
+                "error": terminal_reason,
+                "terminal_uncertain": True,
+                "safe_to_retry": False,
+            }
+            return _json(
+                _finish_tool_result(
+                    ctx.context,
+                    "record_coverage",
+                    arguments,
+                    result,
+                    started,
+                    browser_call=True,
+                )
+            )
         result = {
             "ok": True,
             "coverage_id": existing_id,
@@ -1705,8 +1797,27 @@ async def record_coverage(
     coverage_id = f"cov-{secrets.token_hex(6)}"
     try:
         await ctx.context.actor.audit_step("record_coverage")
-    except Exception:
-        pass
+        terminal_reason = _audit_terminal_reason(ctx.context)
+    except Exception as exc:
+        terminal_reason = _audit_terminal_reason(ctx.context, exc)
+    if terminal_reason is not None:
+        ctx.context.terminal_browser_error = terminal_reason
+        result = {
+            "ok": False,
+            "error": terminal_reason,
+            "terminal_uncertain": True,
+            "safe_to_retry": False,
+        }
+        return _json(
+            _finish_tool_result(
+                ctx.context,
+                "record_coverage",
+                arguments,
+                result,
+                started,
+                browser_call=True,
+            )
+        )
     try:
         coverage_evidence = ctx.context.evidence_store.add(
             "receipt",
@@ -2049,8 +2160,29 @@ async def finish(
     started = time.monotonic()
     try:
         await ctx.context.actor.audit_step("finish")
-    except Exception:
-        pass
+        terminal_reason = _audit_terminal_reason(ctx.context)
+    except Exception as exc:
+        terminal_reason = _audit_terminal_reason(ctx.context, exc)
+    if terminal_reason is not None:
+        ctx.context.terminal_browser_error = terminal_reason
+        result = {
+            "accepted": False,
+            "reasons": [terminal_reason],
+            "instruction": "浏览器终态不确定，当前任务必须终止",
+            "agent_answer": None,
+            "terminal_uncertain": True,
+            "safe_to_retry": False,
+        }
+        return _json(
+            _finish_tool_result(
+                ctx.context,
+                "finish",
+                arguments,
+                result,
+                started,
+                browser_call=True,
+            )
+        )
     selected_coverage_id = coverage_id or ctx.context.latest_coverage_id
     coverage_evidence_id: str | None = None
     if ctx.context.contract.requires_coverage:
@@ -2099,6 +2231,27 @@ async def finish(
         ctx.context.receipts,
         ctx.context.visited_urls,
     )
+    if result.accepted and _actor_poisoned(ctx.context):
+        terminal_reason = _actor_poisoned_reason(ctx.context)
+        ctx.context.terminal_browser_error = terminal_reason
+        payload = {
+            "accepted": False,
+            "reasons": [terminal_reason],
+            "instruction": "浏览器终态不确定，当前任务必须终止",
+            "agent_answer": None,
+            "terminal_uncertain": True,
+            "safe_to_retry": False,
+        }
+        return _json(
+            _finish_tool_result(
+                ctx.context,
+                "finish",
+                arguments,
+                payload,
+                started,
+                browser_call=True,
+            )
+        )
     if result.accepted:
         ctx.context.final_answer = answer
         ctx.context.final_evidence_ids = submitted_evidence_ids
@@ -2212,6 +2365,7 @@ class ProtocolIIIAgent:
         actor: BrowserActor,
         contract: TaskContract,
         evidence_store: EvidenceStore,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         usage_stats = TaskUsageStats(self.worker_id, contract.task_idx, contract.task_id)
         self.model.usage_stats = usage_stats
@@ -2224,6 +2378,7 @@ class ProtocolIIIAgent:
             vision_model=self.model_name,
             usage_stats=usage_stats,
             rate_limiter=self.rate_limiter,
+            progress_callback=progress_callback,
         )
         try:
             await Runner.run(
@@ -2247,6 +2402,9 @@ class ProtocolIIIAgent:
             error = None
         except NoProgressLoopError as exc:
             status = "FAIL_NO_PROGRESS"
+            error = sanitize_exception(exc)
+        except TerminalBrowserError as exc:
+            status = "FAIL_BROWSER_POISONED"
             error = sanitize_exception(exc)
         except MaxTurnsExceeded:
             status = "FAIL_MAX_STEPS"
