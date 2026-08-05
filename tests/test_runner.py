@@ -7,10 +7,12 @@ import pytest
 
 from web_agent.runner import (
     WorkerConfig,
+    _aggregate_stage_diagnostics,
     _aggregate_usage,
     _distribution,
     _kimi_tpm_budget,
     _worker_async,
+    _result_summary,
     atomic_write_json,
     is_completed,
     task_directory,
@@ -200,6 +202,9 @@ async def test_worker_replaces_actor_after_unpoisoned_initialization_failure(tmp
     assert runs == [(2, actors[1])]
     assert all(actor.closed for actor in actors)
     assert [summary["status"] for summary in summaries] == ["FAIL_BROWSER_ERROR", "SUCCESS"]
+    assert summaries[0]["stage_diagnostics"]["diagnostics_complete"] is False
+    assert summaries[0]["stage_diagnostics"]["highest_stage"] == "unknown_after_start"
+    assert summaries[0]["stage_diagnostics"]["last_known_phase"] == "browser_initialization"
 
 
 def test_missing_or_corrupt_manifest_never_authorizes_resume(tmp_path) -> None:
@@ -371,6 +376,7 @@ class ImmediateContext:
 def _write_resumable_result(output, item, fingerprint: str, run_id: str) -> None:  # noqa: ANN001
     directory = task_directory(output, item)
     directory.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(directory / "evidence.json", [])
     atomic_write_json(
         directory / "result.json",
         {
@@ -420,8 +426,65 @@ def test_run_tasks_reuses_matching_manifest_without_starting_worker(tmp_path, mo
     )
 
     assert summary["pending"] == 0
+    assert summary["completed"] == 1
+    assert summary["executed"] == 0
     assert summary["reused"] == 1
+    assert summary["success"] == 1 and summary["failed"] == 0
+    assert summary["model_usage"]["task_count"] == 1
+    assert summary["executed_model_usage"]["task_count"] == 0
     assert summary["run_id"] == manifest["run_id"]
+    assert summary["stage_diagnostics"]["finish_accepted"] == 1
+    assert summary["stage_diagnostics"]["finish_attempt_count"] == 1
+    assert summary["stage_diagnostics"]["task_count"] == 1
+
+
+def test_run_tasks_stage_summary_includes_reused_and_new_tasks(tmp_path, monkeypatch) -> None:
+    import web_agent.run_manifest as manifest_module
+    from web_agent.runner import run_tasks
+
+    monkeypatch.setattr(manifest_module, "_source_hash", lambda: "source-a")
+    items = [
+        {"task_idx": 1, "task_id": "a", "task": "first"},
+        {"task_idx": 2, "task_id": "b", "task": "second"},
+    ]
+    dataset = tmp_path / "tasks.json"
+    dataset.write_text(json.dumps(items), encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    manifest = build_run_manifest(
+        dataset,
+        ["http://localhost:9222"],
+        "model-a",
+        "https://api.test/v1",
+        100,
+        1,
+        900,
+    )
+    atomic_write_json(output / "run_manifest.json", manifest)
+    _write_resumable_result(output, items[0], str(manifest["fingerprint"]), str(manifest["run_id"]))
+    context = ImmediateContext()
+    monkeypatch.setattr("web_agent.runner.mp.get_context", lambda method: context)
+
+    summary = run_tasks(
+        dataset,
+        output,
+        ["http://localhost:9222"],
+        "model-a",
+        "https://api.test/v1",
+        "unused",
+    )
+
+    assert summary["pending"] == 1 and summary["reused"] == 1
+    assert summary["completed"] == 2 and summary["executed"] == 1
+    assert summary["success"] == 1 and summary["failed"] == 1
+    assert summary["model_usage"]["task_count"] == 2
+    assert summary["executed_model_usage"]["task_count"] == 1
+    assert summary["stage_diagnostics"]["finish_accepted"] == 1
+    assert summary["stage_diagnostics"]["task_count"] == 2
+    assert summary["stage_diagnostics"]["highest_stage"] == {
+        "finish_accepted": 1,
+        "not_started": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -664,6 +727,49 @@ def test_usage_aggregation_preserves_task_worker_totals_and_throttle_reasons() -
     assert summary["request_count_per_task"] == {"p50": 1, "p95": 2, "max": 2}
 
 
+def test_stage_diagnostics_and_summary_aggregation_are_consistent() -> None:
+    first = _result_summary(
+        {
+            "task_idx": 1,
+            "status": "FAIL_FINALIZATION_EXHAUSTED",
+            "urls": ["https://example.test/result"],
+            "actions": [{"tool": "click"}, {"tool": "extract"}, {"tool": "finish"}],
+            "tool_outcomes": [
+                {"tool": "click", "progressed": True, "progress_reason": ["new_semantic_state"]},
+                {"tool": "extract", "progressed": True, "progress_reason": ["new_content_hash"]},
+                {"tool": "finish", "result": {"accepted": False}},
+            ],
+            "finalization": {"triggered": True, "outcome": "exhausted"},
+        }
+    )
+    second = _result_summary(
+        {
+            "task_idx": 2,
+            "status": "SUCCESS",
+            "urls": ["https://example.test/answer"],
+            "actions": [{"tool": "finish"}],
+            "tool_outcomes": [{"tool": "finish", "result": {"accepted": True}}],
+            "finalization": {"triggered": False, "outcome": "not_triggered"},
+        }
+    )
+    aggregate = _aggregate_stage_diagnostics([first, second])
+    assert aggregate == {
+        "task_count": 2,
+        "site_reached": 2,
+        "operation_progressed": 1,
+        "candidate_evidence_obtained": 1,
+        "finish_accepted": 1,
+        "finalization_triggered": 1,
+        "finalization_exhausted": 1,
+        "finish_attempt_count": 2,
+        "finish_rejected_count": 1,
+        "diagnostics_incomplete": 0,
+        "highest_stage": {"finalization_exhausted": 1, "finish_accepted": 1},
+        "last_known_phase": {},
+        "finalization_outcome": {"exhausted": 1, "not_triggered": 1},
+    }
+
+
 def test_summary_distribution_reports_p50_p95_and_max() -> None:
     assert _distribution(list(range(1, 101))) == {"p50": 50, "p95": 95, "max": 100}
     assert _distribution([1, 100]) == {"p50": 1, "p95": 100, "max": 100}
@@ -829,6 +935,96 @@ def test_worker_watchdog_terminates_hung_process_and_writes_failures(tmp_path, m
         assert result["status"] == "FAIL_WORKER_WATCHDOG"
         assert result["run_fingerprint"] == summary["run_fingerprint"]
         assert json.loads((directory / "evidence.json").read_text(encoding="utf-8")) == []
+
+
+def test_worker_watchdog_marks_started_task_diagnostics_incomplete(tmp_path, monkeypatch) -> None:
+    from web_agent.runner import run_tasks
+
+    class ProgressQueue:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "kind": "task_started",
+                    "worker_id": 0,
+                    "task_key": "1_a",
+                    "wall_time": 0.0,
+                },
+                {
+                    "kind": "heartbeat",
+                    "worker_id": 0,
+                    "task_key": "1_a",
+                    "phase": "tool_complete:click",
+                },
+            ]
+
+        def get(self, timeout=None):  # noqa: ANN001, ARG002
+            if self.messages:
+                return self.messages.pop(0)
+            raise Empty
+
+        def get_nowait(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise Empty
+
+        def close(self) -> None:
+            pass
+
+        def join_thread(self) -> None:
+            pass
+
+    class HungProcess:
+        exitcode = None
+
+        def __init__(self) -> None:
+            self.alive = False
+
+        def start(self) -> None:
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.alive = False
+            self.exitcode = -15
+
+        def join(self, timeout=None) -> None:  # noqa: ANN001, ARG002
+            pass
+
+    process = HungProcess()
+
+    class FakeContext:
+        def Queue(self) -> ProgressQueue:  # noqa: N802
+            return ProgressQueue()
+
+        def Process(self, **kwargs) -> HungProcess:  # noqa: N802, ARG002
+            return process
+
+    monkeypatch.setattr("web_agent.runner.mp.get_context", lambda method: FakeContext())
+    input_path = tmp_path / "tasks.json"
+    input_path.write_text(
+        json.dumps([{"task_idx": 1, "task_id": "a", "task": "one"}]), encoding="utf-8"
+    )
+    output = tmp_path / "out"
+
+    summary = run_tasks(
+        input_path,
+        output,
+        ["http://localhost:9222"],
+        "test-model",
+        "http://model",
+        "key",
+        worker_watchdog_seconds=0.01,
+    )
+
+    result = json.loads((output / "1_a" / "result.json").read_text(encoding="utf-8"))
+    diagnostics = result["stage_diagnostics"]
+    assert diagnostics["diagnostics_complete"] is False
+    assert diagnostics["last_known_phase"] == "tool_complete:click"
+    assert diagnostics["highest_stage"] == "unknown_after_start"
+    assert diagnostics["operation_progressed"] is False
+    assert summary["stage_diagnostics"]["diagnostics_incomplete"] == 1
 
 
 def test_worker_watchdog_returns_when_process_refuses_terminate_and_kill(tmp_path, monkeypatch) -> None:

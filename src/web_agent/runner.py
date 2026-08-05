@@ -18,7 +18,7 @@ from .browser_actor import BrowserActor
 from .contracts import TaskContract
 from .evidence import EvidenceStore
 from .run_manifest import MANIFEST_SCHEMA_VERSION, build_run_manifest, load_manifest, manifest_matches
-from .runtime import ProtocolIIIAgent
+from .runtime import ProtocolIIIAgent, derive_stage_diagnostics
 from .sanitization import sanitize_exception
 from .token_control import SharedTPMLimiter
 
@@ -181,6 +181,44 @@ def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "error": result.get("error"),
         "model_usage": result.get("model_usage", {}),
         "duration_seconds": result.get("duration_seconds", 0.0),
+        "stage_diagnostics": derive_stage_diagnostics(result),
+        "finalization": result.get("finalization", {}),
+    }
+
+
+def _aggregate_stage_diagnostics(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    diagnostics = [
+        item.get("stage_diagnostics", {})
+        for item in summaries
+        if isinstance(item.get("stage_diagnostics"), dict)
+    ]
+    boolean_keys = (
+        "site_reached",
+        "operation_progressed",
+        "candidate_evidence_obtained",
+        "finish_accepted",
+        "finalization_triggered",
+        "finalization_exhausted",
+    )
+    return {
+        "task_count": len(diagnostics),
+        **{key: sum(value.get(key) is True for value in diagnostics) for key in boolean_keys},
+        "finish_attempt_count": sum(int(value.get("finish_attempt_count", 0)) for value in diagnostics),
+        "finish_rejected_count": sum(int(value.get("finish_rejected_count", 0)) for value in diagnostics),
+        "diagnostics_incomplete": sum(value.get("diagnostics_complete") is False for value in diagnostics),
+        "highest_stage": dict(sorted(Counter(str(value.get("highest_stage")) for value in diagnostics).items())),
+        "last_known_phase": dict(
+            sorted(
+                Counter(
+                    str(value.get("last_known_phase"))
+                    for value in diagnostics
+                    if value.get("last_known_phase") is not None
+                ).items()
+            )
+        ),
+        "finalization_outcome": dict(
+            sorted(Counter(str(value.get("finalization_outcome")) for value in diagnostics).items())
+        ),
     }
 
 
@@ -213,6 +251,8 @@ def _write_stable_worker_failure(
     error: str,
     *,
     parent_only: bool = False,
+    task_started: bool = False,
+    last_known_phase: str | None = None,
 ) -> dict[str, Any]:
     contract = TaskContract.from_item(item)
     task_dir = task_directory(output_root, item)
@@ -230,7 +270,14 @@ def _write_stable_worker_failure(
         "thoughts": [],
         "urls": [],
         "receipts": [],
+        "tool_outcomes": [],
         "predict_length": 0,
+        "finalization": {},
+        "stage_observation": {
+            "complete": not task_started,
+            "task_started": task_started,
+            "last_known_phase": last_known_phase,
+        },
         "model_usage": _empty_model_usage(worker_id, contract),
         "error": error,
         "duration_seconds": 0.0,
@@ -240,6 +287,7 @@ def _write_stable_worker_failure(
         "run_id": run_id,
         "run_manifest_version": MANIFEST_SCHEMA_VERSION,
     }
+    result["stage_diagnostics"] = derive_stage_diagnostics(result)
     if parent_only:
         atomic_write_json(task_dir / "watchdog_failure.json", result)
     else:
@@ -289,6 +337,7 @@ async def _worker_async(
     try:
         for item in items:
             task_started = time.monotonic()
+            task_phase = "task_started"
             contract = TaskContract.from_item(item, config.max_steps)
             task_key = task_directory(Path("."), item).name
             _queue_message(
@@ -303,6 +352,20 @@ async def _worker_async(
             task_dir = task_directory(output_root, item)
             task_dir.mkdir(parents=True, exist_ok=True)
             evidence_store = EvidenceStore()
+
+            def report_progress(phase: str, key: str = task_key) -> None:
+                nonlocal task_phase
+                task_phase = phase
+                _queue_message(
+                    progress_queue,
+                    {
+                        "kind": "heartbeat",
+                        "worker_id": config.worker_id,
+                        "task_key": key,
+                        "phase": phase,
+                    },
+                )
+
             try:
                 if actor.poisoned or actor_reset_required:
                     await actor.retire()
@@ -312,20 +375,14 @@ async def _worker_async(
                         EvidenceStore(),
                     )
                     actor_reset_required = False
+                task_phase = "browser_initialization"
                 await actor.begin_task(contract.website, task_dir, evidence_store)
+                task_phase = "agent_running"
                 run_result = await agent.run(
                     actor,
                     contract,
                     evidence_store,
-                    progress_callback=lambda phase, key=task_key: _queue_message(
-                        progress_queue,
-                        {
-                            "kind": "heartbeat",
-                            "worker_id": config.worker_id,
-                            "task_key": key,
-                            "phase": phase,
-                        },
-                    ),
+                    progress_callback=report_progress,
                 )
             except Exception as exc:
                 actor_reset_required = True
@@ -340,6 +397,11 @@ async def _worker_async(
                     "urls": [],
                     "receipts": [],
                     "predict_length": 0,
+                    "stage_observation": {
+                        "complete": False,
+                        "task_started": True,
+                        "last_known_phase": task_phase,
+                    },
                     "model_usage": _empty_model_usage(config.worker_id, contract),
                     "error": sanitize_exception(exc),
                 }
@@ -361,6 +423,7 @@ async def _worker_async(
                 "run_id": config.run_id,
                 "run_manifest_version": MANIFEST_SCHEMA_VERSION,
             }
+            result["stage_diagnostics"] = derive_stage_diagnostics(result)
             atomic_write_json(task_dir / "result.json", result)
             summary = _result_summary(result)
             summaries.append(summary)
@@ -460,27 +523,40 @@ def run_tasks(
     atomic_write_json(manifest_path, manifest)
     fingerprint = str(manifest["fingerprint"])
     run_id = str(manifest["run_id"])
-    pending = [
-        item
-        for item in items
-        if not is_completed(
-            task_directory(output_dir, item),
-            fingerprint,
-            run_id,
-            manifest_valid=can_resume,
+    pending: list[dict[str, Any]] = []
+    reused_summaries: list[dict[str, Any]] = []
+    for item in items:
+        task_path = task_directory(output_dir, item)
+        reused_summary = (
+            _load_current_run_artifact(task_path, fingerprint, run_id)
+            if is_completed(task_path, fingerprint, run_id, manifest_valid=can_resume)
+            else None
         )
-    ]
-    reused = len(items) - len(pending)
+        if reused_summary is None:
+            pending.append(item)
+        else:
+            reused_summaries.append(reused_summary)
+    reused = len(reused_summaries)
+    tpm_budget = _kimi_tpm_budget(model)
     if not pending:
         summary = {
             "total": len(items),
             "pending": 0,
-            "completed": 0,
+            "completed": len(reused_summaries),
+            "executed": 0,
             "reused": reused,
             "run_fingerprint": fingerprint,
             "run_id": run_id,
-            "model_usage": _aggregate_usage([]),
-            "task_duration_seconds": _distribution([]),
+            "success": sum(item["status"] == "SUCCESS" for item in reused_summaries),
+            "failed": sum(item["status"] != "SUCCESS" for item in reused_summaries),
+            "tpm_safety_budget": tpm_budget,
+            "model_usage": _aggregate_usage(reused_summaries),
+            "executed_model_usage": _aggregate_usage([]),
+            "task_duration_seconds": _distribution(
+                [float(item.get("duration_seconds", 0.0)) for item in reused_summaries]
+            ),
+            "executed_task_duration_seconds": _distribution([]),
+            "stage_diagnostics": _aggregate_stage_diagnostics(reused_summaries),
             "workers": [],
         }
         atomic_write_json(output_dir / "logs" / "summary.json", summary)
@@ -489,7 +565,6 @@ def run_tasks(
     worker_count = min(len(cdp_urls), len(pending), 8)
     shards = [pending[index::worker_count] for index in range(worker_count)]
     context = mp.get_context("spawn")
-    tpm_budget = _kimi_tpm_budget(model)
     queue: Any | None = None
     manager: Any | None = None
     processes: list[mp.Process] = []
@@ -505,6 +580,10 @@ def run_tasks(
         if kind == "task_started":
             state["current_task"] = message.get("task_key")
             state["current_task_wall_time"] = message.get("wall_time")
+            state["started_keys"].add(str(message.get("task_key", "")))
+            state["last_phase"] = "task_started"
+        elif kind == "heartbeat":
+            state["last_phase"] = str(message.get("phase") or "heartbeat")
         elif kind == "task_completed":
             task_key = str(message.get("task_key", ""))
             if task_key and task_key not in state["completed_keys"]:
@@ -575,9 +654,11 @@ def run_tasks(
                 "items": shard,
                 "summaries": [],
                 "completed_keys": set(),
+                "started_keys": set(),
                 "last_progress": time.monotonic(),
                 "current_task": None,
                 "current_task_wall_time": None,
+                "last_phase": None,
                 "done": False,
                 "done_at": None,
                 "error": None,
@@ -685,6 +766,8 @@ def run_tasks(
             failure_status = "FAIL_WORKER_INCOMPLETE"
         failure_error = str(state["error"] or "WORKER_INCOMPLETE: worker 未返回任务完成事件")
         for item in missing_items:
+            task_key = task_directory(Path("."), item).name
+            task_started = task_key in state["started_keys"]
             summary_item = _write_stable_worker_failure(
                 output_dir,
                 item,
@@ -694,6 +777,8 @@ def run_tasks(
                 failure_status,
                 failure_error,
                 parent_only=state["kill_failed"],
+                task_started=task_started,
+                last_known_phase=state["last_phase"] if task_started else None,
             )
             state["summaries"].append(summary_item)
         state["summaries"].sort(key=lambda value: task_keys.index(task_directory(Path("."), value).name))
@@ -702,6 +787,7 @@ def run_tasks(
                 "worker_id": worker_id,
                 "summaries": state["summaries"],
                 "model_usage": _aggregate_usage(state["summaries"]),
+                "stage_diagnostics": _aggregate_stage_diagnostics(state["summaries"]),
                 "error": state["error"],
                 "watchdog_triggered": state["watchdog"],
                 "cleanup_forced": state["cleanup_forced"],
@@ -709,20 +795,27 @@ def run_tasks(
             }
         )
     summaries = [entry for worker in worker_results for entry in worker["summaries"]]
+    all_summaries = [*reused_summaries, *summaries]
     summary = {
         "total": len(items),
         "pending": len(pending),
-        "completed": len(summaries),
+        "completed": len(all_summaries),
+        "executed": len(summaries),
         "reused": reused,
         "run_fingerprint": fingerprint,
         "run_id": run_id,
-        "success": sum(item["status"] == "SUCCESS" for item in summaries),
-        "failed": sum(item["status"] != "SUCCESS" for item in summaries),
+        "success": sum(item["status"] == "SUCCESS" for item in all_summaries),
+        "failed": sum(item["status"] != "SUCCESS" for item in all_summaries),
         "tpm_safety_budget": tpm_budget,
-        "model_usage": _aggregate_usage(summaries),
+        "model_usage": _aggregate_usage(all_summaries),
+        "executed_model_usage": _aggregate_usage(summaries),
         "task_duration_seconds": _distribution(
+            [float(item.get("duration_seconds", 0.0)) for item in all_summaries]
+        ),
+        "executed_task_duration_seconds": _distribution(
             [float(item.get("duration_seconds", 0.0)) for item in summaries]
         ),
+        "stage_diagnostics": _aggregate_stage_diagnostics(all_summaries),
         "workers": worker_results,
     }
     atomic_write_json(output_dir / "logs" / "summary.json", summary)

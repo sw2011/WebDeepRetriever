@@ -62,7 +62,7 @@ SYSTEM_INSTRUCTIONS = """你是 WebRetriever Protocol III 的网页任务执行 
 5. 只有结构化页面、ARIA、网络响应和文档文本均无法表达 Canvas、图片、图表或扫描 PDF 时，才调用 visual_inspect。
 6. 对“全部、完整、列出、前 N、总数、排名”等任务，必须耗尽分页/游标/虚拟列表，先用 record_coverage 从真实证据签发 coverage_id，再在 finish 引用该短标识；不要复制计数或指纹。
 7. finish 的 evidence_bindings 必须覆盖答案字段：标量答案可省略并安全绑定到 `$`；JSON 数组/对象必须按 `$[0]`、`$.items[0]` 等叶子路径逐项绑定。所有 evidence_ids 都必须真实存在。
-8. 不得直接输出最终文本。每一轮必须调用且只调用一个工具，最终只能调用 finish。
+8. 不得直接输出最终文本。每一轮必须调用且只调用一个工具；普通完成只能调用 finish，终局阶段只能调用 finish 或 report_failure。
 9. 工具 Schema 中标记 required 但允许 null 的参数必须显式传 null，不得省略或添加未知字段。
 10. observe 返回 unchanged=true 时不得继续重复 observe/tabs(list)/wait；应使用现有 bid 操作、按需 extract，或在证据不足时 finish 失败原因。
 11. 历史摘要中的结构化证据如需尾部或完整分块，使用 recall_evidence 按 evidence_id 和 offset 回读，不要重复抓取页面。
@@ -70,6 +70,10 @@ SYSTEM_INSTRUCTIONS = """你是 WebRetriever Protocol III 的网页任务执行 
 13. finish 前只回答被问值或列表；数值、单位、前 N/全部条目数必须与绑定证据和 coverage 摘要一致，不得用解释性长答案掩盖缺项。
 14. 工具返回 terminal_uncertain=true 或 ACTOR_POISONED 时，动作终态不确定且浏览器不可继续；不得重试该动作。
 """
+
+FINALIZATION_MODEL_BUDGET = 1
+FINALIZATION_TOOL_BUDGET = 1
+FINALIZATION_TOOLS = {"finish", "report_failure"}
 
 
 class ExtractRequestInput(BaseModel):
@@ -145,6 +149,11 @@ class BoundedToolOutputFilter:
                 "semantic_page_fingerprint",
                 "progress_reason",
                 "cache_hit",
+                "empty",
+                "fallback",
+                "empty_extractions",
+                "verification",
+                "loop_guard",
             ):
                 if key in payload:
                     summary[key] = payload[key]
@@ -237,6 +246,7 @@ class BoundedToolOutputFilter:
                 }
             )
         finish_phase = context.finish_phase
+        finalization = context.finalization_snapshot()
         return {
             "task": context.contract.task,
             "website": context.contract.website,
@@ -252,6 +262,14 @@ class BoundedToolOutputFilter:
             "recent_tool_results": context.tool_outcomes[-self.keep_recent_outputs :],
             "last_verifier_reasons": context.last_finish_reasons,
             "finish_phase": finish_phase,
+            "loop_guard": context.loop_reason if context.loop_detected else None,
+            "finalization": finalization,
+            "finalization_instruction": (
+                "无进展保护已触发。这是唯一一次终局决策：已有证据足够时只调用 finish；"
+                "证据不足时只调用 report_failure 并说明缺失证据。禁止继续浏览、重复提取或猜测答案。"
+                if finalization["triggered"]
+                else None
+            ),
             "budget": {
                 "used": context.tool_steps,
                 "available": context.adaptive_step_budget,
@@ -336,6 +354,10 @@ class BoundedToolOutputFilter:
                 "current_url": checkpoint.get("current_url"),
                 "semantic_page_fingerprint": checkpoint.get("semantic_page_fingerprint"),
                 "coverage_id": checkpoint.get("coverage_id"),
+                "last_verifier_reasons": checkpoint.get("last_verifier_reasons"),
+                "loop_guard": checkpoint.get("loop_guard"),
+                "finalization": checkpoint.get("finalization"),
+                "finalization_instruction": checkpoint.get("finalization_instruction"),
                 "checkpoint_truncated": True,
             }
             bounded = render(minimal)
@@ -394,6 +416,13 @@ class TaskRuntimeContext:
     repeat_count: int = 0
     cycle_count: int = 0
     terminal_browser_error: str | None = None
+    finalization_triggered: bool = False
+    finalization_reason: str | None = None
+    normal_model_requests: int = 0
+    finalization_model_requests: int = 0
+    finalization_tool_calls: int = 0
+    finalization_outcome: str = "not_triggered"
+    final_failure_reason: str | None = None
     progress_callback: Callable[[str], None] | None = None
 
     @property
@@ -416,7 +445,17 @@ class TaskRuntimeContext:
         return f"{name}:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]}"
 
     def record_call(self, name: str, arguments: dict[str, Any]) -> None:
-        if self.tool_steps >= self.hard_step_limit:
+        if name == "report_failure" and not self.finalization_triggered:
+            raise RuntimeError("REPORT_FAILURE_OUTSIDE_FINALIZATION")
+        if self.finalization_triggered:
+            if name not in FINALIZATION_TOOLS:
+                raise RuntimeError(f"FINALIZATION_TOOL_FORBIDDEN: 终局阶段禁止调用 {name}")
+            if self.finalization_model_requests < 1:
+                raise RuntimeError("FINALIZATION_MODEL_REQUEST_REQUIRED: 模型尚未看到终局 guard")
+            if self.finalization_tool_calls >= FINALIZATION_TOOL_BUDGET:
+                raise RuntimeError("FINALIZATION_TOOL_BUDGET_EXHAUSTED")
+            self.finalization_tool_calls += 1
+        elif self.tool_steps >= self.hard_step_limit:
             raise RuntimeError(f"STEP_LIMIT: 工具调用不得超过 {self.hard_step_limit} 步")
         self.tool_steps += 1
         self.actions.append(
@@ -455,12 +494,14 @@ class TaskRuntimeContext:
 
     @staticmethod
     def _content_hash(result: dict[str, Any]) -> str | None:
+        if result.get("empty") is True:
+            return None
         if result.get("content_hash"):
             return str(result["content_hash"])
         key = next((name for name in ("data", "records", "text", "content", "analysis") if name in result), None)
         if key is None:
             return None
-        if result[key] in (None, "", [], {}):
+        if _is_semantically_empty(result[key]):
             return None
         encoded = json.dumps(result[key], sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
@@ -560,7 +601,9 @@ class TaskRuntimeContext:
             hashes.extend(
                 str(item.get("content_hash"))
                 for item in result.get("results", [])
-                if isinstance(item, dict) and item.get("content_hash")
+                if isinstance(item, dict)
+                and item.get("empty") is not True
+                and item.get("content_hash")
             )
             new_hashes = [value for value in hashes if value not in self.seen_content_hashes]
             if new_hashes:
@@ -624,12 +667,37 @@ class TaskRuntimeContext:
                         "coverage_id",
                         "url",
                         "next_offset",
+                        "empty",
+                        "fallback",
+                        "empty_extractions",
                     )
                     if key in result
                 }
                 | (
                     {"post_observation": postconditions["post_observation"]}
                     if isinstance(postconditions.get("post_observation"), dict)
+                    else {}
+                )
+                | (
+                    {
+                        "verification": {
+                            key: postconditions[key]
+                            for key in (
+                                "value",
+                                "expected_value",
+                                "selected",
+                                "requested",
+                                "checked",
+                                "expected_checked",
+                                "value_changed",
+                                "confirmation",
+                                "network_response_count",
+                                "new_tab_count",
+                            )
+                            if key in postconditions
+                        }
+                    }
+                    if postconditions
                     else {}
                 )
                 | ({"content_preview": content_preview} if content_preview is not None else {})
@@ -660,6 +728,11 @@ class TaskRuntimeContext:
             self.repeated_no_info.pop(signature, None)
 
         self._detect_cycle()
+        if self.tool_steps >= self.adaptive_step_budget and not self.finish_accepted:
+            self._trip_loop(
+                "ADAPTIVE_BUDGET",
+                f"已使用 {self.tool_steps} 次工具调用，当前可证明进展额度为 {self.adaptive_step_budget}",
+            )
         if self.actions and self.actions[-1].get("step") == self.tool_steps:
             self.actions[-1].update(
                 {
@@ -692,6 +765,10 @@ class TaskRuntimeContext:
         self.loop_detected = True
         self.loop_reason = f"NO_PROGRESS_LOOP: {code}: {reason}"
         self.thoughts.append(f"loop_guard: {reason}")
+        self.finish_phase = True
+        self.finalization_triggered = True
+        self.finalization_reason = self.loop_reason
+        self.finalization_outcome = "pending"
 
     def note_page_state(self, url: str, semantic_fingerprint: str) -> bool:
         state = (canonical_url(url), semantic_fingerprint)
@@ -724,6 +801,19 @@ class TaskRuntimeContext:
                 f"已使用 {self.tool_steps} 次模型请求，当前可证明进展额度为 {self.adaptive_step_budget}",
             )
 
+    def finalization_snapshot(self) -> dict[str, Any]:
+        return {
+            "triggered": self.finalization_triggered,
+            "trigger_reason": self.finalization_reason,
+            "model_budget": FINALIZATION_MODEL_BUDGET,
+            "tool_budget": FINALIZATION_TOOL_BUDGET,
+            "normal_model_requests": self.normal_model_requests,
+            "model_requests": self.finalization_model_requests,
+            "tool_calls": self.finalization_tool_calls,
+            "outcome": self.finalization_outcome,
+            "failure_reason": self.final_failure_reason,
+        }
+
     def telemetry_snapshot(self) -> dict[str, Any]:
         latest = self.tool_outcomes[-1] if self.tool_outcomes else {}
         return {
@@ -739,6 +829,10 @@ class TaskRuntimeContext:
 
 
 class NoProgressLoopError(RuntimeError):
+    pass
+
+
+class FinalizationExhaustedError(RuntimeError):
     pass
 
 
@@ -767,13 +861,29 @@ class ProtocolRunHooks(RunHooksBase[TaskRuntimeContext, Agent[TaskRuntimeContext
         if context.context.progress_callback is not None:
             context.context.progress_callback("model_start")
         if context.context.terminal_browser_error or _actor_poisoned(context.context):
-            raise TerminalBrowserError(
-                context.context.terminal_browser_error
-                or _actor_poisoned_reason(context.context)
+            context.context.terminal_browser_error = (
+                context.context.terminal_browser_error or _actor_poisoned_reason(context.context)
             )
+            if context.context.finalization_triggered:
+                context.context.finalization_outcome = "browser_terminal"
+            raise TerminalBrowserError(context.context.terminal_browser_error)
         context.context.assert_model_budget()
         if context.context.loop_detected:
-            raise NoProgressLoopError(context.context.loop_reason or "NO_PROGRESS_LOOP")
+            if context.context.finalization_model_requests >= FINALIZATION_MODEL_BUDGET:
+                context.context.finalization_outcome = "exhausted"
+                raise FinalizationExhaustedError(
+                    "FINALIZATION_EXHAUSTED: "
+                    + (context.context.finalization_reason or context.context.loop_reason or "NO_PROGRESS_LOOP")
+                )
+            context.context.finalization_model_requests += 1
+            if context.context.progress_callback is not None:
+                context.context.progress_callback("finalization_model_start")
+            return
+        if context.context.normal_model_requests >= context.context.hard_step_limit:
+            raise MaxTurnsExceeded(
+                f"Protocol III 普通模型请求达到硬上限 {context.context.hard_step_limit}"
+            )
+        context.context.normal_model_requests += 1
 
 
 _INTERACTIVE_TAGS = {"a", "button", "input", "select", "textarea", "option", "summary", "details"}
@@ -1181,6 +1291,13 @@ def _finish_tool_result(
         tool_latency_ms=elapsed_ms,
         browser_latency_ms=elapsed_ms if browser_call else 0.0,
     )
+    if name == "finish" and context.finalization_triggered:
+        if context.terminal_browser_error or _actor_poisoned(context):
+            context.finalization_outcome = "browser_terminal"
+        elif result.get("accepted") is True:
+            context.finalization_outcome = "finish_accepted"
+        else:
+            context.finalization_outcome = "finish_rejected"
     if context.progress_callback is not None:
         context.progress_callback(f"tool_complete:{name}")
     decorated = {
@@ -1269,11 +1386,38 @@ def _tool_failure(ctx: RunContextWrapper[TaskRuntimeContext], error: Exception) 
         )
 
 
-def _tracked_tool(*, timeout: float):
+def _regular_tool_enabled(
+    context: RunContextWrapper[TaskRuntimeContext],
+    agent: Agent[TaskRuntimeContext],
+) -> bool:
+    del agent
+    return not context.context.finalization_triggered
+
+
+def _finalization_tool_enabled(
+    context: RunContextWrapper[TaskRuntimeContext],
+    agent: Agent[TaskRuntimeContext],
+) -> bool:
+    del agent
+    return context.context.finalization_triggered
+
+
+def _tracked_tool(
+    *,
+    timeout: float,
+    finalization_allowed: bool = False,
+    finalization_only: bool = False,
+):
+    if finalization_only:
+        enabled: bool | Callable[[RunContextWrapper[TaskRuntimeContext], Agent[TaskRuntimeContext]], bool]
+        enabled = _finalization_tool_enabled
+    else:
+        enabled = True if finalization_allowed else _regular_tool_enabled
     return function_tool(
         timeout=timeout,
         failure_error_function=_tool_failure,
         timeout_error_function=_tool_failure,
+        is_enabled=enabled,
     )
 
 
@@ -1460,6 +1604,45 @@ async def download(ctx: RunContextWrapper[TaskRuntimeContext], bid: str) -> str:
     return output
 
 
+def _is_semantically_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, dict):
+        return not value or all(_is_semantically_empty(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return not value or all(_is_semantically_empty(item) for item in value)
+    return False
+
+
+def _with_extract_fallback(payload: dict[str, Any], kind: str) -> dict[str, Any]:
+    content = next(
+        (payload[key] for key in ("data", "records", "text", "content") if key in payload),
+        None,
+    )
+    if not _is_semantically_empty(content):
+        return payload
+    alternatives = {
+        "table": ["text", "list"],
+        "list": ["text", "table"],
+        "links": ["text", "list"],
+        "text": ["list", "table"],
+    }[kind]
+    return {
+        **payload,
+        "empty": True,
+        "fallback": {
+            "reason": f"{kind} 形态未提取到内容",
+            "alternative_kinds": alternatives,
+            "instruction": (
+                "不要重复相同调用；可在同一页面或 bid 范围改用 alternative_kinds，"
+                "或直接利用 evidence_ledger 中已有证据作终局判断"
+            ),
+        },
+    }
+
+
 @_tracked_tool(timeout=20.0)
 async def extract(
     ctx: RunContextWrapper[TaskRuntimeContext],
@@ -1486,7 +1669,7 @@ async def extract(
         return _json(result, limit=24_000)
     try:
         result = await ctx.context.actor.extract(kind, bid, limit)
-        payload = {"ok": True, "kind": kind, **result}
+        payload = _with_extract_fallback({"ok": True, "kind": kind, **result}, kind)
         actual_state = str(result.get("semantic_page_fingerprint") or state)
         actual_key = TaskRuntimeContext._signature("extract", {"state": actual_state, **arguments})
         ctx.context.extract_cache[actual_key] = payload
@@ -1532,13 +1715,13 @@ async def extract_many(
         pending_cache: list[tuple[str, dict[str, Any]]] = []
         for (index, value, key), item in zip(unique_misses, fetched, strict=True):
             actual_state = str(item.get("semantic_page_fingerprint") or state)
-            payload = {
+            payload = _with_extract_fallback({
                 "ok": True,
                 "kind": value["kind"],
                 **item,
                 "semantic_page_fingerprint": actual_state,
                 "cache_hit": False,
-            }
+            }, value["kind"])
             actual_key = TaskRuntimeContext._signature("extract", {"state": actual_state, **value})
             pending_cache.append((actual_key, payload))
             output[index] = payload
@@ -1566,6 +1749,15 @@ async def extract_many(
                 "ok": True,
                 "results": output,
                 "cache_hit_count": sum(bool(item and item.get("cache_hit")) for item in output),
+                "empty_extractions": [
+                    {
+                        "index": index,
+                        "kind": item.get("kind"),
+                        "fallback": item.get("fallback"),
+                    }
+                    for index, item in enumerate(output)
+                    if isinstance(item, dict) and item.get("empty") is True
+                ],
                 "semantic_page_fingerprint": next(iter(actual_states)),
             }
         combined = _finish_tool_result(
@@ -2300,7 +2492,7 @@ def _answer_shape_reasons(
     return reasons
 
 
-@_tracked_tool(timeout=5.0)
+@_tracked_tool(timeout=5.0, finalization_allowed=True)
 async def finish(
     ctx: RunContextWrapper[TaskRuntimeContext],
     answer: str,
@@ -2431,18 +2623,67 @@ async def finish(
     return _json(_finish_tool_result(ctx.context, "finish", arguments, payload, started))
 
 
+@_tracked_tool(timeout=5.0, finalization_only=True)
+async def report_failure(
+    ctx: RunContextWrapper[TaskRuntimeContext],
+    reason: str,
+    evidence_ids: list[str],
+) -> str:
+    """终局阶段证据不足时提交结构化失败；不接受候选答案，也不恢复浏览。"""
+    if not ctx.context.finalization_triggered:
+        return _json(
+            {
+                "ok": False,
+                "completed": False,
+                "error": "report_failure 只允许在无进展保护触发后的终局阶段使用",
+            }
+        )
+    normalized_reason = str(redact_value(reason)).strip()[:2_000] or "现有证据不足，且未提供具体缺失项"
+    arguments = {"reason": normalized_reason, "evidence_ids": evidence_ids}
+    ctx.context.record_call("report_failure", arguments)
+    started = time.monotonic()
+    known_ids = [value for value in dict.fromkeys(evidence_ids) if ctx.context.evidence_store.get(value)]
+    unknown_ids = [value for value in dict.fromkeys(evidence_ids) if value not in known_ids]
+    ctx.context.final_failure_reason = normalized_reason
+    ctx.context.finalization_outcome = "insufficient_evidence"
+    result = {
+        "ok": True,
+        "completed": True,
+        "status": "FAIL_INSUFFICIENT_EVIDENCE",
+        "reason": normalized_reason,
+        "evidence_ids": known_ids,
+        "unknown_evidence_ids": unknown_ids,
+        "agent_answer": None,
+    }
+    return _json(_finish_tool_result(ctx.context, "report_failure", arguments, result, started))
+
+
 async def _verified_finish_behavior(
     context: RunContextWrapper[TaskRuntimeContext],
     tool_results: list[FunctionToolResult],
 ) -> ToolsToFinalOutputResult:
+    if context.context.terminal_browser_error or _actor_poisoned(context.context):
+        context.context.terminal_browser_error = (
+            context.context.terminal_browser_error or _actor_poisoned_reason(context.context)
+        )
+        context.context.finalization_outcome = "browser_terminal"
+        raise TerminalBrowserError(context.context.terminal_browser_error)
     for tool_result in tool_results:
-        if tool_result.tool.name != "finish":
-            continue
         try:
             payload = json.loads(str(tool_result.output))
         except json.JSONDecodeError:
             payload = {}
-        if payload.get("accepted") is True and context.context.finish_accepted:
+        if (
+            tool_result.tool.name == "finish"
+            and payload.get("accepted") is True
+            and context.context.finish_accepted
+        ):
+            return ToolsToFinalOutputResult(is_final_output=True, final_output=tool_result.output)
+        if (
+            tool_result.tool.name == "report_failure"
+            and payload.get("completed") is True
+            and context.context.final_failure_reason is not None
+        ):
             return ToolsToFinalOutputResult(is_final_output=True, final_output=tool_result.output)
     return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
 
@@ -2469,7 +2710,129 @@ TOOLS = [
     visual_inspect,
     visual_document,
     finish,
+    report_failure,
 ]
+
+
+_OPERATION_TOOLS = {
+    "click",
+    "fill",
+    "select",
+    "set_checked",
+    "press",
+    "scroll",
+    "tabs",
+    "dialog",
+    "upload",
+    "download",
+}
+_CANDIDATE_EVIDENCE_REASONS = {"new_content_hash", "new_evidence_chunk", "valid_coverage_handle"}
+
+
+def derive_stage_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    actions = result.get("actions", []) if isinstance(result.get("actions"), list) else []
+    outcomes = result.get("tool_outcomes", []) if isinstance(result.get("tool_outcomes"), list) else []
+    receipts = result.get("receipts", []) if isinstance(result.get("receipts"), list) else []
+    finalization = result.get("finalization", {}) if isinstance(result.get("finalization"), dict) else {}
+    finish_outcomes = [item for item in outcomes if isinstance(item, dict) and item.get("tool") == "finish"]
+    finish_attempt_count = sum(
+        1 for item in actions if isinstance(item, dict) and item.get("tool") == "finish"
+    )
+    finish_accepted = any(
+        isinstance(item.get("result"), dict) and item["result"].get("accepted") is True
+        for item in finish_outcomes
+    ) or result.get("status") == "SUCCESS"
+    if finish_accepted and finish_attempt_count == 0:
+        finish_attempt_count = 1
+    finish_rejected_count = sum(
+        1
+        for item in finish_outcomes
+        if isinstance(item.get("result"), dict) and item["result"].get("accepted") is False
+    )
+    site_reached = bool(result.get("urls")) or any(
+        "new_url" in item.get("progress_reason", []) for item in outcomes if isinstance(item, dict)
+    )
+    operation_progressed = any(
+        item.get("tool") in _OPERATION_TOOLS and item.get("progressed") is True
+        for item in outcomes
+        if isinstance(item, dict)
+    )
+    if not outcomes:
+        operation_progressed = any(
+            isinstance(receipt, dict)
+            and receipt.get("action") in _OPERATION_TOOLS
+            and receipt.get("success") is True
+            and (
+                receipt.get("changed") is True
+                or (
+                    receipt.get("before_url")
+                    and receipt.get("after_url")
+                    and receipt.get("before_url") != receipt.get("after_url")
+                )
+                or (
+                    receipt.get("before_dom_hash")
+                    and receipt.get("after_dom_hash")
+                    and receipt.get("before_dom_hash") != receipt.get("after_dom_hash")
+                )
+                or (
+                    isinstance(receipt.get("postconditions"), dict)
+                    and (
+                        receipt["postconditions"].get("value_changed") is True
+                        or receipt["postconditions"].get("confirmation") is True
+                    )
+                )
+            )
+            for receipt in receipts
+        )
+    candidate_evidence_obtained = any(
+        bool(_CANDIDATE_EVIDENCE_REASONS.intersection(item.get("progress_reason", [])))
+        for item in outcomes
+        if isinstance(item, dict)
+    )
+    finalization_triggered = finalization.get("triggered") is True
+    finalization_outcome = str(finalization.get("outcome") or "not_triggered")
+    finalization_exhausted = finalization_outcome == "exhausted"
+    stage_observation = (
+        result.get("stage_observation", {})
+        if isinstance(result.get("stage_observation"), dict)
+        else {}
+    )
+    diagnostics_complete = stage_observation.get("complete") is not False
+    last_known_phase = stage_observation.get("last_known_phase")
+    if finish_accepted:
+        highest_stage = "finish_accepted"
+    elif finalization_exhausted:
+        highest_stage = "finalization_exhausted"
+    elif finalization_outcome == "insufficient_evidence":
+        highest_stage = "finalization_insufficient_evidence"
+    elif finish_rejected_count:
+        highest_stage = "finish_rejected"
+    elif finish_attempt_count:
+        highest_stage = "finish_attempted"
+    elif candidate_evidence_obtained:
+        highest_stage = "candidate_evidence"
+    elif operation_progressed:
+        highest_stage = "operation_progressed"
+    elif site_reached:
+        highest_stage = "site_reached"
+    elif not diagnostics_complete and stage_observation.get("task_started") is True:
+        highest_stage = "unknown_after_start"
+    else:
+        highest_stage = "not_started"
+    return {
+        "site_reached": site_reached,
+        "operation_progressed": operation_progressed,
+        "candidate_evidence_obtained": candidate_evidence_obtained,
+        "finish_attempt_count": finish_attempt_count,
+        "finish_rejected_count": finish_rejected_count,
+        "finish_accepted": finish_accepted,
+        "finalization_triggered": finalization_triggered,
+        "finalization_exhausted": finalization_exhausted,
+        "finalization_outcome": finalization_outcome,
+        "diagnostics_complete": diagnostics_complete,
+        "last_known_phase": last_known_phase,
+        "highest_stage": highest_stage,
+    }
 
 
 def _model_settings(model: str) -> ModelSettings:
@@ -2536,7 +2899,7 @@ class ProtocolIIIAgent:
                     f"模型请求预算：基础 30，按可证明进展增加，绝对上限 {context.hard_step_limit}"
                 ),
                 context=context,
-                max_turns=context.hard_step_limit,
+                max_turns=context.hard_step_limit + FINALIZATION_MODEL_BUDGET,
                 hooks=ProtocolRunHooks(),
                 run_config=RunConfig(
                     tracing_disabled=True,
@@ -2546,8 +2909,22 @@ class ProtocolIIIAgent:
                     tool_not_found_behavior="return_error_to_model",
                 ),
             )
-            status = "SUCCESS" if context.finish_accepted else "FAIL_UNVERIFIED_FINISH"
-            error = None
+            if context.finish_accepted:
+                status = "SUCCESS"
+                error = None
+            elif context.final_failure_reason is not None:
+                status = "FAIL_INSUFFICIENT_EVIDENCE"
+                error = context.final_failure_reason
+            elif context.finalization_triggered:
+                context.finalization_outcome = "exhausted"
+                status = "FAIL_FINALIZATION_EXHAUSTED"
+                error = "终局决策未提交可验证答案或结构化失败"
+            else:
+                status = "FAIL_UNVERIFIED_FINISH"
+                error = None
+        except FinalizationExhaustedError as exc:
+            status = "FAIL_FINALIZATION_EXHAUSTED"
+            error = sanitize_exception(exc)
         except NoProgressLoopError as exc:
             status = "FAIL_NO_PROGRESS"
             error = sanitize_exception(exc)
@@ -2555,14 +2932,26 @@ class ProtocolIIIAgent:
             status = "FAIL_BROWSER_POISONED"
             error = sanitize_exception(exc)
         except MaxTurnsExceeded:
-            status = "FAIL_MAX_STEPS"
-            error = f"达到 Protocol III 模型请求硬上限 {context.hard_step_limit}，且没有通过验证的 finish"
+            if context.terminal_browser_error or _actor_poisoned(context):
+                context.terminal_browser_error = (
+                    context.terminal_browser_error or _actor_poisoned_reason(context)
+                )
+                context.finalization_outcome = "browser_terminal"
+                status = "FAIL_BROWSER_POISONED"
+                error = context.terminal_browser_error
+            elif context.finalization_triggered:
+                context.finalization_outcome = "exhausted"
+                status = "FAIL_FINALIZATION_EXHAUSTED"
+                error = "终局决策达到固定模型请求上限，且没有通过验证的 finish"
+            else:
+                status = "FAIL_MAX_STEPS"
+                error = f"达到 Protocol III 模型请求硬上限 {context.hard_step_limit}，且没有通过验证的 finish"
         except Exception as exc:
             status = "FAIL_AGENT_ERROR"
             error = sanitize_exception(exc)
         finally:
             self.model.usage_stats = None
-        return {
+        result = {
             "status": status,
             "agent_answer": context.final_answer if status == "SUCCESS" else None,
             "evidence_ids": context.final_evidence_ids,
@@ -2576,6 +2965,9 @@ class ProtocolIIIAgent:
             "progress_credit": context.progress_credit,
             "adaptive_step_budget": context.adaptive_step_budget,
             "tool_outcomes": context.tool_outcomes,
+            "finalization": context.finalization_snapshot(),
             "model_usage": usage_stats.to_dict(),
             "error": error,
         }
+        result["stage_diagnostics"] = derive_stage_diagnostics(result)
+        return result

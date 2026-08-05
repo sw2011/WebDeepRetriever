@@ -7,18 +7,31 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from agents import FunctionToolResult, MaxTurnsExceeded, RunContextWrapper, Usage
+from agents import (
+    Agent,
+    FunctionToolResult,
+    MaxTurnsExceeded,
+    RunConfig,
+    RunContextWrapper,
+    Runner,
+    ToolExecutionConfig,
+    Usage,
+)
+from agents.items import ModelResponse
+from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from agents.run_config import CallModelData, ModelInputData
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseFunctionToolCall
 
 from web_agent.browser_actor import ActorCallDeadlineExceeded
 from web_agent.contracts import CoverageCertificate, TaskContract
 from web_agent.evidence import EvidenceStore
 from web_agent.runtime import (
+    SYSTEM_INSTRUCTIONS,
     TOOLS,
     BoundedToolOutputFilter,
-    NoProgressLoopError,
+    FinalizationExhaustedError,
     ProtocolRunHooks,
     ProtocolIIIAgent,
     TaskRuntimeContext,
@@ -32,6 +45,7 @@ from web_agent.runtime import (
     _tool_failure,
     _verified_finish_behavior,
     _vision_completion,
+    derive_stage_diagnostics,
 )
 from web_agent.token_control import (
     MAX_SERIALIZED_CONTEXT_BYTES,
@@ -96,6 +110,11 @@ def test_all_function_tools_have_strict_closed_schemas() -> None:
     for tool in TOOLS:
         assert tool.strict_json_schema is True
         assert tool.params_json_schema.get("additionalProperties") is False
+
+
+def test_system_instructions_match_finalization_tool_policy() -> None:
+    assert "普通完成只能调用 finish" in SYSTEM_INSTRUCTIONS
+    assert "终局阶段只能调用 finish 或 report_failure" in SYSTEM_INSTRUCTIONS
 
 
 def test_kimi_k26_uses_tool_compatible_settings() -> None:
@@ -631,19 +650,60 @@ def test_repeated_observation_filter_keeps_last_changed_bid_catalog() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_progress_loop_stops_before_another_model_request() -> None:
+async def test_no_progress_loop_gets_one_bounded_finalization_request_with_guard() -> None:
     context = make_context()
+    evidence = context.evidence_store.add(
+        "dom", "https://example.test/result", "candidate", {"data": "verified candidate"}
+    )
+    context.last_finish_reasons = ["last verifier reason"]
     assert context.note_page_state("https://example.test", "same") is False
     for _ in range(context.no_progress_limit):
         assert context.note_page_state("https://example.test", "same") is True
     assert context.loop_detected is True
-    with pytest.raises(NoProgressLoopError, match="NO_PROGRESS_LOOP"):
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    checkpoint = json.dumps(filtered.input, ensure_ascii=False)
+    assert "loop_guard" in checkpoint and "NO_PROGRESS_LOOP" in checkpoint
+    assert evidence.evidence_id in checkpoint
+    assert "https://example.test" in checkpoint
+    assert "last verifier reason" in checkpoint
+    assert "唯一一次终局决策" in checkpoint
+
+    await ProtocolRunHooks().on_llm_start(
+        RunContextWrapper(context),
+        SimpleNamespace(),  # type: ignore[arg-type]
+        "system",
+        filtered.input,
+    )
+    assert context.finalization_model_requests == 1
+    with pytest.raises(FinalizationExhaustedError, match="FINALIZATION_EXHAUSTED"):
         await ProtocolRunHooks().on_llm_start(
             RunContextWrapper(context),
             SimpleNamespace(),  # type: ignore[arg-type]
             "system",
             [],
         )
+
+
+@pytest.mark.asyncio
+async def test_reserved_finalization_turn_cannot_be_spent_by_normal_requests() -> None:
+    context = make_context(max_steps=2)
+    hooks = ProtocolRunHooks()
+    for _ in range(2):
+        await hooks.on_llm_start(
+            RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+        )
+    with pytest.raises(MaxTurnsExceeded, match="普通模型请求达到硬上限 2"):
+        await hooks.on_llm_start(
+            RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+        )
+    assert context.normal_model_requests == 2
+    assert context.finalization_model_requests == 0
 
 
 @pytest.mark.asyncio
@@ -782,6 +842,7 @@ async def test_returning_to_unobserved_prior_state_still_gets_full_catalog() -> 
 @pytest.mark.asyncio
 async def test_poisoned_actor_stops_before_another_model_request() -> None:
     context = make_context()
+    context._trip_loop("STATE_ACTION_CYCLE", "test")
     context.actor = SimpleNamespace(  # type: ignore[assignment]
         poisoned=True,
         poisoned_reason="ACTOR_POISONED: click 终态不确定",
@@ -793,6 +854,9 @@ async def test_poisoned_actor_stops_before_another_model_request() -> None:
             "system",
             [],
         )
+    assert context.finalization_model_requests == 0
+    assert context.terminal_browser_error == "ACTOR_POISONED: click 终态不确定"
+    assert context.finalization_outcome == "browser_terminal"
 
 
 def test_new_page_states_and_scroll_progress_reset_loop_counter() -> None:
@@ -1181,6 +1245,293 @@ async def test_only_accepted_finish_stops_tool_loop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finalization_exposes_only_finish_or_structured_failure() -> None:
+    protocol = ProtocolIIIAgent("test", "http://127.0.0.1:9/v1", "key")
+    context = make_context()
+    initial = {tool.name for tool in await protocol.agent.get_all_tools(RunContextWrapper(context))}
+    assert "observe" in initial and "finish" in initial
+    assert "report_failure" not in initial
+
+    context._trip_loop("REPEATED_TOOL", "same extract")
+    terminal = {tool.name for tool in await protocol.agent.get_all_tools(RunContextWrapper(context))}
+    assert terminal == {"finish", "report_failure"}
+    with pytest.raises(RuntimeError, match="FINALIZATION_TOOL_FORBIDDEN"):
+        context.record_call("observe", {})
+
+
+@pytest.mark.asyncio
+async def test_same_response_cannot_spend_finalization_tool_budget_before_guard() -> None:
+    context = make_context()
+    context._trip_loop("REPEATED_TOOL", "same response extract")
+
+    with pytest.raises(RuntimeError, match="FINALIZATION_MODEL_REQUEST_REQUIRED"):
+        context.record_call("finish", {"answer": "guess", "evidence_ids": []})
+    assert context.finalization_tool_calls == 0
+    assert context.tool_steps == 0
+
+    await ProtocolRunHooks().on_llm_start(
+        RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+    )
+    context.record_call("report_failure", {"reason": "missing evidence", "evidence_ids": []})
+    assert context.finalization_tool_calls == 1
+    assert context.tool_steps == 1
+
+
+@pytest.mark.asyncio
+async def test_real_runner_requires_guarded_request_after_multi_tool_response() -> None:
+    class EmptyActor(DummyActor):
+        poisoned = False
+        task_generation = 1
+
+        async def extract(self, kind: str, bid: str | None, limit: int) -> dict[str, object]:
+            return {
+                "data": [],
+                "content_hash": "empty-content",
+                "semantic_page_fingerprint": "page-1",
+            }
+
+    class ScriptedModel(Model):
+        def __init__(self) -> None:
+            self.inputs: list[object] = []
+            self.toolsets: list[set[str]] = []
+
+        async def get_response(
+            self,
+            system_instructions,  # noqa: ANN001
+            input,  # noqa: A002, ANN001
+            model_settings,  # noqa: ANN001
+            tools,  # noqa: ANN001
+            output_schema,  # noqa: ANN001
+            handoffs,  # noqa: ANN001
+            tracing,  # noqa: ANN001
+            **kwargs,  # noqa: ANN003
+        ) -> ModelResponse:
+            self.inputs.append(input)
+            self.toolsets.append({tool.name for tool in tools})
+            if len(self.inputs) == 1:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps({"kind": "table", "bid": None, "limit": 100}),
+                        call_id="extract",
+                        name="extract",
+                        type="function_call",
+                    ),
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(
+                            {
+                                "answer": "guess",
+                                "evidence_ids": [],
+                                "evidence_bindings": [],
+                                "coverage_id": None,
+                            }
+                        ),
+                        call_id="premature-finish",
+                        name="finish",
+                        type="function_call",
+                    ),
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps({"reason": "no evidence", "evidence_ids": []}),
+                        call_id="bounded-failure",
+                        name="report_failure",
+                        type="function_call",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(), response_id=None)
+
+        def stream_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise NotImplementedError
+
+    context = make_context()
+    context.actor = EmptyActor()  # type: ignore[assignment]
+    context.no_progress_limit = 1
+    context.current_url = "https://example.test"
+    context.current_semantic_fingerprint = "page-1"
+    context.seen_page_states.add(("https://example.test/", "page-1"))
+    model = ScriptedModel()
+    agent = Agent(
+        name="bounded-finalization-test",
+        instructions=SYSTEM_INSTRUCTIONS,
+        model=model,
+        tools=TOOLS,
+        model_settings=_model_settings("gpt-4.1-mini"),
+        tool_use_behavior=_verified_finish_behavior,
+        reset_tool_choice=False,
+    )
+
+    await Runner.run(
+        agent,
+        input="task",
+        context=context,
+        max_turns=3,
+        hooks=ProtocolRunHooks(),
+        run_config=RunConfig(
+            tracing_disabled=True,
+            call_model_input_filter=BoundedToolOutputFilter(),
+            tool_execution=ToolExecutionConfig(max_function_tool_concurrency=1),
+            tool_not_found_behavior="return_error_to_model",
+        ),
+    )
+
+    assert len(model.inputs) == 2
+    assert "NO_PROGRESS_LOOP" in json.dumps(model.inputs[1], ensure_ascii=False)
+    assert model.toolsets[1] == {"finish", "report_failure"}
+    assert [action["tool"] for action in context.actions] == ["extract", "report_failure"]
+    assert context.finalization_model_requests == 1
+    assert context.finalization_tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_finalization_can_accept_finish_with_existing_evidence() -> None:
+    context = make_context()
+    evidence = context.evidence_store.add("dom", "https://example.test", "answer", {"data": "7"})
+    context.visited_urls.append("https://example.test")
+    context._trip_loop("REPEATED_TOOL", "same extract")
+    await ProtocolRunHooks().on_llm_start(
+        RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+    )
+
+    finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
+    arguments = json.dumps({"answer": "7", "evidence_ids": [evidence.evidence_id]})
+    output = await finish_tool.on_invoke_tool(
+        ToolContext(context, tool_name="finish", tool_call_id="terminal-finish", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+    assert payload["accepted"] is True
+    assert context.finish_accepted is True
+    assert context.finalization_snapshot() == {
+        "triggered": True,
+        "trigger_reason": context.loop_reason,
+        "model_budget": 1,
+        "tool_budget": 1,
+        "normal_model_requests": 0,
+        "model_requests": 1,
+        "tool_calls": 1,
+        "outcome": "finish_accepted",
+        "failure_reason": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_finalization_reports_insufficient_evidence_without_answer() -> None:
+    context = make_context()
+    context._trip_loop("STATE_ACTION_CYCLE", "same state")
+    await ProtocolRunHooks().on_llm_start(
+        RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+    )
+    failure_tool = next(tool for tool in TOOLS if tool.name == "report_failure")
+    arguments = json.dumps({"reason": "缺少包含目标数值的候选证据", "evidence_ids": []})
+    output = await failure_tool.on_invoke_tool(
+        ToolContext(context, tool_name="report_failure", tool_call_id="terminal-failure", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+    assert payload["completed"] is True
+    assert payload["status"] == "FAIL_INSUFFICIENT_EVIDENCE"
+    assert payload["agent_answer"] is None
+    assert context.final_answer is None
+    assert context.finalization_outcome == "insufficient_evidence"
+    decision = await _verified_finish_behavior(
+        RunContextWrapper(context),
+        [FunctionToolResult(tool=failure_tool, output=output, run_item=None)],
+    )
+    assert decision.is_final_output is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_actor_overrides_structured_finalization_result() -> None:
+    context = make_context()
+    context._trip_loop("STATE_ACTION_CYCLE", "same state")
+    context.finalization_model_requests = 1
+    context.final_failure_reason = "missing evidence"
+    context.actor.poisoned = True
+    context.actor.poisoned_reason = "CDP_DISCONNECTED"
+    failure_tool = next(tool for tool in TOOLS if tool.name == "report_failure")
+    result = FunctionToolResult(
+        tool=failure_tool,
+        output=json.dumps({"completed": True, "status": "FAIL_INSUFFICIENT_EVIDENCE"}),
+        run_item=None,
+    )
+
+    with pytest.raises(TerminalBrowserError, match="CDP_DISCONNECTED"):
+        await _verified_finish_behavior(RunContextWrapper(context), [result])
+    assert context.terminal_browser_error == "CDP_DISCONNECTED"
+    assert context.finalization_outcome == "browser_terminal"
+
+
+@pytest.mark.asyncio
+async def test_real_runner_detects_actor_poisoned_after_finalization_hook() -> None:
+    class PoisonableActor(DummyActor):
+        poisoned = False
+        poisoned_reason = None
+
+    class PoisoningModel(Model):
+        async def get_response(
+            self,
+            system_instructions,  # noqa: ANN001
+            input,  # noqa: A002, ANN001
+            model_settings,  # noqa: ANN001
+            tools,  # noqa: ANN001
+            output_schema,  # noqa: ANN001
+            handoffs,  # noqa: ANN001
+            tracing,  # noqa: ANN001
+            **kwargs,  # noqa: ANN003
+        ) -> ModelResponse:
+            actor.poisoned = True
+            actor.poisoned_reason = "CDP_DISCONNECTED"
+            return ModelResponse(
+                output=[
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps({"reason": "no evidence", "evidence_ids": []}),
+                        call_id="failure",
+                        name="report_failure",
+                        type="function_call",
+                    )
+                ],
+                usage=Usage(),
+                response_id=None,
+            )
+
+        def stream_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise NotImplementedError
+
+    actor = PoisonableActor()
+    context = make_context()
+    context.actor = actor  # type: ignore[assignment]
+    context._trip_loop("STATE_ACTION_CYCLE", "same state")
+    agent = Agent(
+        name="poison-after-hook-test",
+        instructions=SYSTEM_INSTRUCTIONS,
+        model=PoisoningModel(),
+        tools=TOOLS,
+        model_settings=_model_settings("gpt-4.1-mini"),
+        tool_use_behavior=_verified_finish_behavior,
+        reset_tool_choice=False,
+    )
+
+    with pytest.raises(TerminalBrowserError, match="CDP_DISCONNECTED"):
+        await Runner.run(
+            agent,
+            input="task",
+            context=context,
+            max_turns=2,
+            hooks=ProtocolRunHooks(),
+            run_config=RunConfig(
+                tracing_disabled=True,
+                call_model_input_filter=BoundedToolOutputFilter(),
+                tool_execution=ToolExecutionConfig(max_function_tool_concurrency=1),
+                tool_not_found_behavior="return_error_to_model",
+            ),
+        )
+    assert context.finalization_model_requests == 1
+    assert context.terminal_browser_error == "CDP_DISCONNECTED"
+    assert context.finalization_outcome == "browser_terminal"
+
+
+@pytest.mark.asyncio
 async def test_coverage_certificate_must_be_runtime_signed_and_untampered() -> None:
     context = make_context()
     context.contract = TaskContract.from_item(
@@ -1385,6 +1736,25 @@ async def test_max_turns_never_becomes_success(monkeypatch) -> None:
     assert result["agent_answer"] is None
 
 
+@pytest.mark.asyncio
+async def test_poisoned_actor_takes_priority_over_finalization_max_turns(monkeypatch) -> None:
+    async def poison_then_exceed(*args, **kwargs):  # noqa: ANN002, ANN003
+        context = kwargs["context"]
+        context._trip_loop("STATE_ACTION_CYCLE", "same state")
+        context.actor.poisoned = True
+        context.actor.poisoned_reason = "CDP_DISCONNECTED"
+        raise MaxTurnsExceeded("limit")
+
+    monkeypatch.setattr("web_agent.runtime.Runner.run", poison_then_exceed)
+    actor = DummyActor()
+    agent = ProtocolIIIAgent("test", "http://127.0.0.1:9/v1", "key")
+    result = await agent.run(actor, make_context().contract, EvidenceStore())  # type: ignore[arg-type]
+    assert result["status"] == "FAIL_BROWSER_POISONED"
+    assert result["agent_answer"] is None
+    assert result["error"] == "CDP_DISCONNECTED"
+    assert result["finalization"]["outcome"] == "browser_terminal"
+
+
 def test_default_main_does_not_import_uitars() -> None:
     source = open("src/agent/main.py", encoding="utf-8").read()
     assert "UITARSAgent" not in source
@@ -1400,11 +1770,12 @@ def test_state_action_cycles_period_one_to_four_are_stopped() -> None:
             context.record_call("dialog", arguments)
             context.record_tool_outcome("dialog", arguments, {"ok": False, "error": "offline"})
         assert context.loop_detected is True
+        assert context.finalization_triggered is True
         assert f"周期 {period}" in str(context.loop_reason)
 
 
 @pytest.mark.asyncio
-async def test_identical_rejected_finish_stops_before_third_request() -> None:
+async def test_identical_rejected_finish_gets_only_one_finalization_request() -> None:
     context = make_context()
     finish_tool = next(tool for tool in TOOLS if tool.name == "finish")
     arguments = json.dumps({"answer": "7", "evidence_ids": []})
@@ -1416,7 +1787,10 @@ async def test_identical_rejected_finish_stops_before_third_request() -> None:
         assert json.loads(output)["accepted"] is False
     assert context.tool_steps == 2
     assert context.loop_detected is True
-    with pytest.raises(NoProgressLoopError, match="REPEATED_FINISH"):
+    await ProtocolRunHooks().on_llm_start(
+        RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
+    )
+    with pytest.raises(FinalizationExhaustedError, match="REPEATED_FINISH"):
         await ProtocolRunHooks().on_llm_start(
             RunContextWrapper(context), SimpleNamespace(), "system", []  # type: ignore[arg-type]
         )
@@ -1536,6 +1910,61 @@ async def test_extract_many_is_sequential_bounded_and_deduplicates_requests() ->
 
 
 @pytest.mark.asyncio
+async def test_extract_many_empty_fallback_survives_checkpoint_compaction() -> None:
+    class MixedActor(DummyActor):
+        async def extract_many(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
+            assert [request["kind"] for request in requests] == ["table", "text"]
+            return [
+                {
+                    "data": [["", "  "]],
+                    "evidence_id": "ev-empty",
+                    "content_hash": "actor-empty-hash",
+                    "semantic_page_fingerprint": "page-1",
+                },
+                {
+                    "data": "answer",
+                    "evidence_id": "ev-answer",
+                    "content_hash": "answer-hash",
+                    "semantic_page_fingerprint": "page-1",
+                },
+            ]
+
+    context = make_context()
+    context.actor = MixedActor()  # type: ignore[assignment]
+    context.current_semantic_fingerprint = "page-1"
+    tool = next(item for item in TOOLS if item.name == "extract_many")
+    arguments = json.dumps(
+        {
+            "requests": [
+                {"kind": "table", "bid": None, "limit": 100},
+                {"kind": "text", "bid": None, "limit": 100},
+            ]
+        }
+    )
+    output = await tool.on_invoke_tool(
+        ToolContext(context, tool_name="extract_many", tool_call_id="many-empty", tool_arguments=arguments),
+        arguments,
+    )
+    payload = json.loads(output)
+    assert payload["empty_extractions"][0]["fallback"]["alternative_kinds"] == ["text", "list"]
+    assert context.tool_outcomes[-1]["result"]["empty_extractions"] == payload["empty_extractions"]
+    assert "new_content_hash" in context.tool_outcomes[-1]["progress_reason"]
+    assert "actor-empty-hash" not in context.seen_content_hashes
+    assert "answer-hash" in context.seen_content_hashes
+
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    checkpoint = json.dumps(filtered.input, ensure_ascii=False)
+    assert "empty_extractions" in checkpoint
+    assert "alternative_kinds" in checkpoint
+
+
+@pytest.mark.asyncio
 async def test_extract_many_rejects_mixed_semantic_states_without_publishing_cache() -> None:
     class DriftingManyActor(DummyActor):
         async def extract_many(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -1574,6 +2003,46 @@ async def test_extract_many_rejects_mixed_semantic_states_without_publishing_cac
     assert payload["ok"] is False
     assert payload["semantic_page_fingerprints"] == ["state-a", "state-b"]
     assert list(context.extract_cache) == [cached_key]
+
+
+@pytest.mark.asyncio
+async def test_empty_table_extract_gives_fallback_before_repeated_extract_guard() -> None:
+    class EmptyActor(DummyActor):
+        poisoned = False
+        task_generation = 1
+
+        async def extract(self, kind: str, bid: str | None, limit: int) -> dict[str, object]:
+            return {
+                "data": [["", "  "]],
+                "evidence_id": "ev-empty",
+                "content_hash": "actor-empty-hash",
+                "url": "https://example.test/results",
+                "semantic_page_fingerprint": "same-results",
+            }
+
+    context = make_context()
+    context.actor = EmptyActor()  # type: ignore[assignment]
+    tool = next(item for item in TOOLS if item.name == "extract")
+    arguments = json.dumps({"kind": "table", "bid": None, "limit": 1000})
+    outputs = []
+    for index in range(3):
+        outputs.append(
+            json.loads(
+                await tool.on_invoke_tool(
+                    ToolContext(context, tool_name="extract", tool_call_id=str(index), tool_arguments=arguments),
+                    arguments,
+                )
+            )
+        )
+    assert outputs[0]["empty"] is True
+    assert outputs[0]["fallback"]["alternative_kinds"] == ["text", "list"]
+    assert "不要重复" in outputs[0]["fallback"]["instruction"]
+    assert "new_content_hash" not in outputs[0]["progress_reason"]
+    assert derive_stage_diagnostics(
+        {"status": "FAIL_NO_PROGRESS", "actions": context.actions, "tool_outcomes": context.tool_outcomes}
+    )["candidate_evidence_obtained"] is False
+    assert outputs[-1]["loop_guard"].startswith("NO_PROGRESS_LOOP: REPEATED_TOOL")
+    assert context.finalization_triggered is True
 
 
 @pytest.mark.asyncio
@@ -1651,6 +2120,7 @@ def test_adaptive_budget_is_base_thirty_plus_progress_with_absolute_sixty() -> N
         stalled.record_tool_outcome("dialog", arguments, {"ok": False})
     stalled.assert_model_budget()
     assert stalled.loop_detected is True
+    assert stalled.finalization_triggered is True
     assert stalled.adaptive_step_budget == 30
 
     progressing = make_context()
@@ -1856,6 +2326,77 @@ def test_changed_action_updates_checkpoint_and_clears_stale_bids() -> None:
     assert '"stale"' not in checkpoint
 
 
+def test_action_verification_values_survive_working_memory_compaction() -> None:
+    context = make_context()
+    cases = [
+        (
+            "fill",
+            {"bid": "date", "value": "2025-01-31"},
+            {
+                "value": "2025-01-31",
+                "expected_value": "2025-01-31",
+                "value_changed": True,
+            },
+        ),
+        (
+            "select",
+            {"bid": "period", "values": ["monthly"]},
+            {"selected": ["monthly"], "requested": ["monthly"], "value_changed": True},
+        ),
+        (
+            "set_checked",
+            {"bid": "enabled", "checked": True},
+            {"checked": True, "expected_checked": True, "value_changed": True},
+        ),
+        (
+            "click",
+            {"bid": "submit"},
+            {"confirmation": True, "network_response_count": 2, "new_tab_count": 1},
+        ),
+    ]
+    for index, (tool, arguments, verification) in enumerate(cases):
+        context.record_call(tool, arguments)
+        context.record_tool_outcome(
+            tool,
+            arguments,
+            {
+                "success": True,
+                "after_url": "https://example.test/search?end=2025-01-31",
+                "postconditions": {
+                    **verification,
+                    "confirmation": verification.get("confirmation", False),
+                    "network_response_count": verification.get("network_response_count", 0),
+                    "new_tab_count": verification.get("new_tab_count", 0),
+                    "after_semantic_page_fingerprint": f"configured-{index}",
+                    "post_observation": {
+                        "url": "https://example.test/search?end=2025-01-31",
+                        "semantic_page_fingerprint": f"configured-{index}",
+                    },
+                },
+            },
+        )
+    filtered = BoundedToolOutputFilter()(
+        CallModelData(
+            model_data=ModelInputData(input=[{"role": "user", "content": "task"}], instructions="i"),  # type: ignore[arg-type]
+            agent=SimpleNamespace(),
+            context=context,
+        )
+    )
+    checkpoint_item = filtered.input[-1]
+    assert isinstance(checkpoint_item, dict)
+    checkpoint = json.loads(str(checkpoint_item["content"]).split("\n", 1)[1])
+    by_tool = {item["tool"]: item["result"]["verification"] for item in checkpoint["recent_tool_results"]}
+    assert by_tool["fill"]["value"] == "2025-01-31"
+    assert by_tool["fill"]["expected_value"] == "2025-01-31"
+    assert by_tool["select"]["selected"] == ["monthly"]
+    assert by_tool["select"]["requested"] == ["monthly"]
+    assert by_tool["set_checked"]["checked"] is True
+    assert by_tool["set_checked"]["expected_checked"] is True
+    assert by_tool["click"]["confirmation"] is True
+    assert by_tool["click"]["network_response_count"] == 2
+    assert by_tool["click"]["new_tab_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_scalar_finish_safely_defaults_root_evidence_binding() -> None:
     context = make_context()
@@ -1868,6 +2409,66 @@ async def test_scalar_finish_safely_defaults_root_evidence_binding() -> None:
     )
     assert json.loads(output)["accepted"] is True
     assert context.final_bindings == {"$": [evidence.evidence_id]}
+    assert context.finalization_triggered is False
+
+
+def test_stage_diagnostics_distinguish_progress_evidence_finish_and_exhaustion() -> None:
+    result = {
+        "status": "FAIL_FINALIZATION_EXHAUSTED",
+        "urls": ["https://example.test/results"],
+        "actions": [{"tool": "click"}, {"tool": "extract"}, {"tool": "finish"}],
+        "tool_outcomes": [
+            {"tool": "click", "progressed": True, "progress_reason": ["new_semantic_state"]},
+            {"tool": "extract", "progressed": True, "progress_reason": ["new_content_hash"]},
+            {"tool": "finish", "result": {"accepted": False}, "progress_reason": ["no_new_information"]},
+        ],
+        "finalization": {"triggered": True, "outcome": "exhausted"},
+    }
+    diagnostics = derive_stage_diagnostics(result)
+    assert diagnostics == {
+        "site_reached": True,
+        "operation_progressed": True,
+        "candidate_evidence_obtained": True,
+        "finish_attempt_count": 1,
+        "finish_rejected_count": 1,
+        "finish_accepted": False,
+        "finalization_triggered": True,
+        "finalization_exhausted": True,
+        "finalization_outcome": "exhausted",
+        "diagnostics_complete": True,
+        "last_known_phase": None,
+        "highest_stage": "finalization_exhausted",
+    }
+
+
+def test_stage_diagnostics_conservatively_support_legacy_receipts_and_success() -> None:
+    progressed = derive_stage_diagnostics(
+        {
+            "status": "FAIL_AGENT_ERROR",
+            "urls": ["https://example.test"],
+            "actions": [{"tool": "fill"}],
+            "receipts": [
+                {
+                    "action": "fill",
+                    "success": True,
+                    "changed": True,
+                    "before_url": "https://example.test",
+                    "after_url": "https://example.test",
+                    "before_dom_hash": "before",
+                    "after_dom_hash": "after",
+                    "postconditions": {"value_changed": True},
+                }
+            ],
+        }
+    )
+    assert progressed["operation_progressed"] is True
+    assert progressed["candidate_evidence_obtained"] is False
+    assert progressed["highest_stage"] == "operation_progressed"
+
+    accepted = derive_stage_diagnostics({"status": "SUCCESS", "actions": [], "urls": []})
+    assert accepted["finish_accepted"] is True
+    assert accepted["finish_attempt_count"] == 1
+    assert accepted["highest_stage"] == "finish_accepted"
 
 
 @pytest.mark.asyncio
