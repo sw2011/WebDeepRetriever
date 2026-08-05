@@ -153,6 +153,25 @@ async def test_native_custom_form_duplicate_labels_stale_bid_and_spa(
     assert one_element(delayed_observation, text="SPA ready")["changed"] is True
 
 
+async def test_actionability_timeout_is_recoverable_before_real_click(actor_factory: Any) -> None:
+    actor: BrowserActor = await actor_factory("/actionability")
+    actor.click_timeout_ms = 1_000
+    observation = await actor.observe()
+    covered = one_element(observation, tag="button", text="Covered action")
+    remove_overlay = one_element(observation, tag="button", text="Remove overlay")
+
+    blocked = await actor.click(covered["bid"])
+    assert blocked["success"] is False
+    assert blocked["safe_to_retry"] is True
+    assert blocked["terminal_uncertain"] is False
+    assert actor.poisoned is False
+
+    assert (await actor.click(remove_overlay["bid"]))["success"] is True
+    assert (await actor.click(covered["bid"]))["success"] is True
+    assert actor.poisoned is False
+    assert "Clicked" in (await actor.extract("text"))["data"]
+
+
 async def test_nested_iframe_and_open_shadow_dom(actor_factory: Any) -> None:
     actor: BrowserActor = await actor_factory("/frames")
     observation = await actor.observe()

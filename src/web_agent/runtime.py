@@ -356,6 +356,7 @@ class TaskRuntimeContext:
     visited_urls: list[str] = field(default_factory=list)
     latest_elements: dict[str, dict[str, Any]] = field(default_factory=dict)
     latest_model_elements: list[dict[str, Any]] = field(default_factory=list)
+    latest_model_element_state: tuple[str, str] | None = None
     downloaded_paths: set[str] = field(default_factory=set)
     scanned_document_paths: set[str] = field(default_factory=set)
     final_answer: str | None = None
@@ -527,8 +528,9 @@ class TaskRuntimeContext:
                 reasons.append("new_semantic_state")
             self.last_observation_state = state
             self.current_semantic_fingerprint = str(semantic)
-            if state_before[1] and state_before[1] != str(semantic):
+            if self.latest_model_element_state != state:
                 self.latest_model_elements = []
+                self.latest_model_element_state = None
 
         if success and name == "scroll" and postconditions.get("after") != postconditions.get("before"):
             reasons.append("scroll_position_changed")
@@ -792,7 +794,11 @@ _INTERACTIVE_ROLES = {
     "textbox",
 }
 _ACTION_LABEL = re.compile(
-    r"(?:next|previous|prev|continue|more|search|submit|download|下一|上一|继续|更多|搜索|提交|下载)",
+    r"(?:\b(?:next|previous|prev|continue|more|search|submit|download|view)\b|下一|上一|继续|更多|搜索|提交|下载|查看)",
+    re.IGNORECASE,
+)
+_PRIMARY_ACTION_LABEL = re.compile(
+    r"(?:\b(?:search|submit|download|view)\b|搜索|提交|下载|查看)",
     re.IGNORECASE,
 )
 
@@ -924,7 +930,7 @@ def _project_observation(
     max_chars: int = 20_000,
 ) -> dict[str, Any]:
     terms = _task_terms(task)
-    candidates: list[tuple[int, int, dict[str, Any], bool, bool]] = []
+    candidates: list[tuple[int, int, dict[str, Any], bool, bool, bool]] = []
     frame_errors: list[dict[str, Any]] = []
     for index, element in enumerate(result.get("elements", [])):
         if not isinstance(element, dict) or not element.get("bid"):
@@ -935,7 +941,10 @@ def _project_observation(
         context_text = " ".join(str(value) for value in context) if isinstance(context, list) else ""
         searchable = " ".join(
             [
-                *(str(element.get(key, "")).casefold() for key in ("text", "label", "name", "role", "tag", "href")),
+                *(
+                    str(element.get(key, "")).casefold()
+                    for key in ("text", "label", "name", "role", "tag", "href", "value")
+                ),
                 context_text.casefold(),
             ]
         )
@@ -944,6 +953,7 @@ def _project_observation(
         visible = element.get("visible") is not False
         semantic = element.get("tag") in {"h1", "h2", "h3", "h4", "label", "th", "caption"}
         action_label = bool(interactive and _ACTION_LABEL.search(searchable))
+        primary_action_label = bool(interactive and _PRIMARY_ACTION_LABEL.search(searchable))
         score = (
             relevance * 100
             + int(interactive) * 60
@@ -955,15 +965,23 @@ def _project_observation(
         )
         if not (interactive or semantic or relevance or visible):
             continue
-        candidates.append((score, index, element, interactive, visible))
+        candidates.append((score, index, element, interactive, visible, primary_action_label))
     candidates.sort(key=lambda value: (-value[0], value[1]))
 
     element_limit = min(max_elements, 24) if unchanged else max_elements
     char_limit = min(max_chars, 6_000) if unchanged else max_chars
     interactive_quota = min(60, max(1, element_limit // 2))
-    reserved = [candidate for candidate in candidates if candidate[3] and candidate[4]][:interactive_quota]
-    reserved_bids = {str(candidate[2].get("bid")) for candidate in reserved}
+    primary_quota = min(12, max(1, element_limit // 10))
+    primary_reserved = [candidate for candidate in candidates if candidate[5]][:primary_quota]
+    primary_bids = {str(candidate[2].get("bid")) for candidate in primary_reserved}
+    reserved = [
+        candidate
+        for candidate in candidates
+        if candidate[3] and candidate[4] and str(candidate[2].get("bid")) not in primary_bids
+    ][:interactive_quota]
+    reserved_bids = primary_bids | {str(candidate[2].get("bid")) for candidate in reserved}
     ordered_candidates = [
+        *primary_reserved,
         *reserved,
         *(candidate for candidate in candidates if str(candidate[2].get("bid")) not in reserved_bids),
     ]
@@ -1055,7 +1073,7 @@ def _project_observation(
         base["scroll_truncated_for_model"] = True
 
     deferred_options: dict[int, tuple[list[dict[str, Any]], bool]] = {}
-    for _, index, element, _, _ in ordered_candidates:
+    for _, index, element, _, _, _ in ordered_candidates:
         if len(projected) >= element_limit:
             break
         compact = _compact_element(element)
@@ -1298,10 +1316,12 @@ async def observe(ctx: RunContextWrapper[TaskRuntimeContext]) -> str:
         }
         ctx.context.visited_urls.append(result["url"])
         semantic = str(result.get("semantic_page_fingerprint") or result["dom_hash"])
-        unchanged = (canonical_url(result["url"]), semantic) == ctx.context.last_observation_state
+        observed_state = (canonical_url(result["url"]), semantic)
+        unchanged = observed_state == ctx.context.latest_model_element_state
         result = _finish_tool_result(ctx.context, "observe", {}, result, started, browser_call=True)
         model_result = _project_observation(result, ctx.context.contract.task, unchanged=unchanged)
         ctx.context.latest_model_elements = list(model_result["elements"])
+        ctx.context.latest_model_element_state = observed_state
         return _json(
             {
                 "ok": True,

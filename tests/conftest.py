@@ -185,6 +185,16 @@ PAGES: dict[str, str] = {
     "/thread": f"""<!doctype html><html><head><title>Thread test</title>{BASE_STYLE}</head><body>
       <label for="thread-input">Thread value</label><input id="thread-input" name="thread-input">
     </body></html>""",
+    "/actionability": f"""<!doctype html><html><head><title>Actionability</title>{BASE_STYLE}</head><body>
+      <h1>Actionability boundary</h1>
+      <div style="position:relative;width:220px;height:60px">
+        <button id="covered" style="position:absolute;inset:0;margin:0"
+          onclick="document.getElementById('action-result').textContent='Clicked'">Covered action</button>
+        <div id="overlay" style="position:absolute;inset:0;z-index:2;background:#ddd">Blocking overlay</div>
+      </div>
+      <button id="remove-overlay" onclick="document.getElementById('overlay').remove()">Remove overlay</button>
+      <p id="action-result">Not clicked</p>
+    </body></html>""",
 }
 
 PAGES["/large-dom"] = (

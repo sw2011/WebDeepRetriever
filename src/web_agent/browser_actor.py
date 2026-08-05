@@ -18,6 +18,7 @@ from typing import Any, Callable, TypeVar
 from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from pypdf import PdfReader
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .contracts import ActionReceipt
 from .evidence import EvidenceStore
@@ -36,6 +37,32 @@ from browsergym.core.observation import (  # noqa: E402
 )
 
 T = TypeVar("T")
+
+_PRE_DISPATCH_ACTIONABILITY = (
+    "element is not visible",
+    "element is not enabled",
+    "element is not stable",
+    "element is outside of the viewport",
+    "intercepts pointer events",
+    "element was detached from the dom",
+    "waiting for element to be visible",
+    "waiting for element to be enabled",
+    "waiting for element to receive pointer events",
+)
+_POST_DISPATCH_CALL_LOG = (
+    "performing click action",
+    "click action done",
+    "waiting for scheduled navigations",
+)
+
+
+def _is_pre_dispatch_actionability_timeout(exc: Exception) -> bool:
+    if not isinstance(exc, PlaywrightTimeoutError):
+        return False
+    message = str(exc).casefold()
+    return not any(marker in message for marker in _POST_DISPATCH_CALL_LOG) and any(
+        marker in message for marker in _PRE_DISPATCH_ACTIONABILITY
+    )
 
 
 class BrowserActorPoisonedError(RuntimeError):
@@ -72,6 +99,18 @@ class _CallDispatchState:
                 return False
             self._dispatched = True
             return True
+
+    def can_prepare(self, deadline: float | None) -> bool:
+        with self._lock:
+            if self._cancelled or (deadline is not None and time.monotonic() >= deadline):
+                self._cancelled = True
+                return False
+            return True
+
+    def retract(self) -> None:
+        with self._lock:
+            if not self._cancelled:
+                self._dispatched = False
 
     def cancel_if_queued(self) -> bool:
         with self._lock:
@@ -771,7 +810,9 @@ class BrowserActor:
             if was_dispatched:
                 future.add_done_callback(consume_late_result)
             else:
-                call.concurrent_future.cancel()
+                cancelled = call.concurrent_future.cancel()
+                if not cancelled:
+                    future.add_done_callback(consume_late_result)
             raise ActorCallDeadlineExceeded(
                 call.operation,
                 dispatched=was_dispatched,
@@ -790,7 +831,9 @@ class BrowserActor:
             if was_dispatched:
                 future.add_done_callback(consume_late_result)
             else:
-                call.concurrent_future.cancel()
+                cancelled = call.concurrent_future.cancel()
+                if not cancelled:
+                    future.add_done_callback(consume_late_result)
             raise
 
     async def _call(
@@ -1530,7 +1573,13 @@ class BrowserActor:
     def _click_op(self, bid: str) -> dict[str, Any]:
         locator = self._locator(bid)
         target = self._element_state(locator)
-        self._dispatch_mutation(lambda: locator.click(timeout=self.click_timeout_ms))
+        self._prepare_mutation(
+            lambda: locator.click(timeout=self._playwright_timeout_ms(), trial=True)
+        )
+        self._dispatch_mutation(
+            lambda: locator.click(timeout=self._playwright_timeout_ms()),
+            safe_failure=_is_pre_dispatch_actionability_timeout,
+        )
         return {"target": target}
 
     async def fill(self, bid: str, value: str) -> dict[str, Any]:
@@ -1595,7 +1644,20 @@ class BrowserActor:
     def _set_checked_op(self, bid: str, checked: bool) -> dict[str, Any]:
         locator = self._locator(bid)
         before = locator.is_checked()
-        self._dispatch_mutation(lambda: locator.set_checked(checked, timeout=self.click_timeout_ms))
+        if before == checked:
+            return {
+                "before_checked": before,
+                "checked": before,
+                "expected_checked": checked,
+                "value_changed": False,
+            }
+        self._prepare_mutation(
+            lambda: locator.set_checked(checked, timeout=self._playwright_timeout_ms(), trial=True)
+        )
+        self._dispatch_mutation(
+            lambda: locator.set_checked(checked, timeout=self._playwright_timeout_ms()),
+            safe_failure=_is_pre_dispatch_actionability_timeout,
+        )
         after = locator.is_checked()
         return {
             "before_checked": before,
@@ -1812,15 +1874,19 @@ class BrowserActor:
         )
 
     def _download_op(self, bid: str) -> dict[str, Any]:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
         pdf_cursor = len(self._pdf_responses)
         locator = self._locator(bid)
         href = locator.get_attribute("href")
         expected_url = urljoin(self._page.url, href) if href else None
+        self._prepare_mutation(
+            lambda: locator.click(timeout=self._playwright_timeout_ms(), trial=True)
+        )
         try:
-            with self._page.expect_download(timeout=self.click_timeout_ms) as info:
-                self._dispatch_mutation(lambda: locator.click(timeout=self.click_timeout_ms))
+            with self._page.expect_download(timeout=self._playwright_timeout_ms()) as info:
+                self._dispatch_mutation(
+                    lambda: locator.click(timeout=self._playwright_timeout_ms()),
+                    safe_failure=_is_pre_dispatch_actionability_timeout,
+                )
             download = info.value
             destination = self.output_dir / "downloads" / download.suggested_filename
             download.save_as(str(destination))
@@ -2105,7 +2171,33 @@ class BrowserActor:
             "el => ({bid:el.getAttribute('bid'),tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.innerText||el.textContent||'').trim().slice(0,300),value:'value' in el?(el.type==='password'?'[REDACTED]':String(el.value||'')):'',checked:'checked' in el?Boolean(el.checked):null,selected:'selected' in el?Boolean(el.selected):null})"
         )
 
-    def _dispatch_mutation(self, operation: Callable[[], T]) -> T:
+    def _prepare_mutation(self, operation: Callable[[], T]) -> T:
+        mutation_state = getattr(self._thread_context, "mutation_state", None)
+        deadline = getattr(self._thread_context, "deadline", None)
+        operation_name = str(getattr(self._thread_context, "operation", "action"))
+        generation, attempt = self._binding()
+        if mutation_state is not None and not mutation_state.can_prepare(deadline):
+            raise ActorCallDeadlineExceeded(
+                operation_name,
+                dispatched=False,
+                task_generation=generation,
+                attempt=attempt,
+            )
+        return operation()
+
+    def _playwright_timeout_ms(self) -> int:
+        deadline = getattr(self._thread_context, "deadline", None)
+        if deadline is None:
+            return self.click_timeout_ms
+        remaining_ms = int((deadline - time.monotonic()) * 1_000) - 1_000
+        return max(1, min(self.click_timeout_ms, remaining_ms))
+
+    def _dispatch_mutation(
+        self,
+        operation: Callable[[], T],
+        *,
+        safe_failure: Callable[[Exception], bool] | None = None,
+    ) -> T:
         mutation_state = getattr(self._thread_context, "mutation_state", None)
         deadline = getattr(self._thread_context, "deadline", None)
         operation_name = str(getattr(self._thread_context, "operation", "action"))
@@ -2123,7 +2215,19 @@ class BrowserActor:
             if window is not None:
                 window["mutation_dispatched_ms"] = dispatched_ms
         self._thread_context.mutation_dispatched = True
-        return operation()
+        try:
+            return operation()
+        except Exception as exc:
+            if safe_failure is None or not safe_failure(exc):
+                raise
+            if mutation_state is not None:
+                mutation_state.retract()
+            with self._state_lock:
+                window = self._attempt_windows.get((generation, attempt))
+                if window is not None:
+                    window["mutation_dispatched_ms"] = None
+            self._thread_context.mutation_dispatched = False
+            raise
 
     def _action_sync(self, action: str, operation: Callable[[], dict[str, Any]], bid: str | None) -> dict[str, Any]:
         self._assert_thread()
@@ -2256,7 +2360,10 @@ class BrowserActor:
             self._capture_step(action)
         except Exception:
             pass
-        return receipt.to_dict()
+        result = receipt.to_dict()
+        if not success:
+            result.update({"terminal_uncertain": False, "safe_to_retry": True})
+        return result
 
     @staticmethod
     def _is_confirmed_submission(

@@ -521,7 +521,7 @@ async def test_deadline_during_precondition_never_dispatches_mutation(tmp_path) 
     click_count = 0
 
     class Locator:
-        def click(self, timeout: int) -> None:  # noqa: ARG002
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
             nonlocal click_count
             click_count += 1
 
@@ -568,6 +568,202 @@ async def test_deadline_during_precondition_never_dispatches_mutation(tmp_path) 
     assert await asyncio.to_thread(finished.wait, 1)
     assert click_count == 0
     assert await actor._call(lambda: "still-usable") == "still-usable"
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_actionability_trial_is_safe_and_late_result_is_consumed(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    trial_started = threading.Event()
+    release_trial = threading.Event()
+    finished = threading.Event()
+    actual_clicks = 0
+
+    class Locator:
+        def evaluate(self, expression: str) -> dict[str, object]:  # noqa: ARG002
+            return {"bid": "abc", "tag": "button", "type": "button", "text": "Open"}
+
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            nonlocal actual_clicks
+            if trial:
+                trial_started.set()
+                release_trial.wait(timeout=2)
+            else:
+                actual_clicks += 1
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    state = {
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._connected = True
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: state  # type: ignore[method-assign]
+
+    def invoke() -> dict[str, object]:
+        try:
+            return actor._action_sync("click", lambda: actor._click_op("abc"), "abc")
+        finally:
+            finished.set()
+
+    call = asyncio.create_task(
+        actor._call(
+            invoke,
+            deadline=time.monotonic() + 0.2,
+            operation="click",
+            mutation_aware=True,
+        )
+    )
+    assert await asyncio.to_thread(trial_started.wait, 1)
+    with pytest.raises(ActorCallDeadlineExceeded) as caught:
+        await call
+    assert caught.value.dispatched is False
+    assert actor.poisoned is False
+
+    release_trial.set()
+    assert await asyncio.to_thread(finished.wait, 1)
+    await asyncio.sleep(0)
+    assert actual_clicks == 0
+    assert await actor._call(lambda: "still-usable") == "still-usable"
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_actionability_failure_before_click_dispatch_keeps_actor_usable(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    fail_actionability = True
+    calls: list[bool] = []
+
+    class Locator:
+        def evaluate(self, expression: str) -> dict[str, object]:  # noqa: ARG002
+            return {"bid": "abc", "tag": "button", "type": "button", "text": "Open"}
+
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            calls.append(trial)
+            if trial and fail_actionability:
+                raise PlaywrightTimeoutError("element is not visible")
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    state = {
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._connected = True
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: state  # type: ignore[method-assign]
+    actor._settle = lambda: state  # type: ignore[method-assign]
+
+    failed = await actor.click("abc")
+    assert failed["success"] is False
+    assert failed["safe_to_retry"] is True
+    assert failed["terminal_uncertain"] is False
+    assert actor.poisoned is False
+    assert calls == [True]
+
+    fail_actionability = False
+    succeeded = await actor.click("abc")
+    assert succeeded["success"] is True
+    assert calls == [True, True, False]
+    assert actor.poisoned is False
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_actionability_failure_between_trial_and_real_click_keeps_actor_usable(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    fail_real_actionability = True
+    calls: list[bool] = []
+
+    class Locator:
+        def evaluate(self, expression: str) -> dict[str, object]:  # noqa: ARG002
+            return {"bid": "abc", "tag": "button", "type": "button", "text": "Open"}
+
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            calls.append(trial)
+            if not trial and fail_real_actionability:
+                raise PlaywrightTimeoutError(
+                    "Locator.click: Timeout exceeded.\n"
+                    "- attempting click action\n"
+                    "- waiting for element to be visible, enabled and stable\n"
+                    "- element is not visible"
+                )
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    state = {
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._connected = True
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: state  # type: ignore[method-assign]
+    actor._settle = lambda: state  # type: ignore[method-assign]
+
+    failed = await actor.click("abc")
+    assert failed["success"] is False
+    assert failed["safe_to_retry"] is True
+    assert failed["terminal_uncertain"] is False
+    assert actor.poisoned is False
+    assert calls == [True, False]
+
+    fail_real_actionability = False
+    assert (await actor.click("abc"))["success"] is True
+    assert calls == [True, False, True, False]
+    assert actor.poisoned is False
+    tmp_path.mkdir(exist_ok=True)
+    await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_set_checked_noop_does_not_dispatch_mutation(tmp_path) -> None:
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    set_checked_calls = 0
+
+    class Locator:
+        def is_checked(self) -> bool:
+            return True
+
+        def set_checked(self, checked: bool, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            nonlocal set_checked_calls
+            set_checked_calls += 1
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    state = {
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._connected = True
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: state  # type: ignore[method-assign]
+    actor._settle = lambda: state  # type: ignore[method-assign]
+
+    result = await actor.set_checked("abc", True)
+    assert result["success"] is True
+    assert result["postconditions"]["value_changed"] is False
+    assert set_checked_calls == 0
+    assert actor.poisoned is False
     tmp_path.mkdir(exist_ok=True)
     await actor.close()
 
@@ -765,8 +961,9 @@ def test_late_pdf_response_cannot_satisfy_next_download_attempt(tmp_path) -> Non
         def get_attribute(self, name: str) -> str | None:
             return "/wanted.pdf" if name == "href" else None
 
-        def click(self, timeout: int) -> None:  # noqa: ARG002
-            actor._capture_response(response, actor.task_generation)
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            if not trial:
+                actor._capture_response(response, actor.task_generation)
 
     actor._page = SimpleNamespace(
         url="https://current.test/page",
@@ -828,8 +1025,9 @@ def test_current_non_navigation_pdf_matching_link_can_satisfy_download_fallback(
         def get_attribute(self, name: str) -> str | None:
             return "/current.pdf" if name == "href" else None
 
-        def click(self, timeout: int) -> None:  # noqa: ARG002
-            actor._capture_response(response, actor.task_generation)
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            if not trial:
+                actor._capture_response(response, actor.task_generation)
 
     actor._page = SimpleNamespace(
         url="https://example.test/page",
@@ -883,8 +1081,9 @@ def test_unrelated_non_navigation_pdf_cannot_satisfy_download_fallback(tmp_path)
         def get_attribute(self, name: str) -> str | None:
             return "/expected.pdf" if name == "href" else None
 
-        def click(self, timeout: int) -> None:  # noqa: ARG002
-            actor._capture_response(response, actor.task_generation)
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            if not trial:
+                actor._capture_response(response, actor.task_generation)
 
     actor._page = SimpleNamespace(
         url="https://example.test/page",
@@ -896,6 +1095,71 @@ def test_unrelated_non_navigation_pdf_cannot_satisfy_download_fallback(tmp_path)
         actor._download_op("pdf")
 
     assert list((tmp_path / "downloads").iterdir()) == []
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_download_trial_failure_is_safe_but_post_click_timeout_poisons(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    actor._owner_thread = threading.get_ident()
+    actor._connected = True
+    fail_actionability = True
+    download_waits = 0
+
+    class ExpectDownload:
+        def __enter__(self):
+            nonlocal download_waits
+            download_waits += 1
+            return SimpleNamespace()
+
+        def __exit__(self, exc_type, exc, traceback):  # noqa: ANN001, ARG002
+            raise PlaywrightTimeoutError("no download")
+
+    class Locator:
+        def get_attribute(self, name: str) -> str | None:
+            return "/report" if name == "href" else None
+
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            if trial and fail_actionability:
+                raise PlaywrightTimeoutError("element is not visible")
+
+    page = SimpleNamespace(
+        url="https://example.test/page",
+        is_closed=lambda: False,
+        expect_download=lambda timeout: ExpectDownload(),
+    )
+    state = {
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: state  # type: ignore[method-assign]
+
+    safe_failure = actor._action_sync(
+        "download",
+        lambda: actor._download_op("report"),
+        "report",
+    )
+    assert safe_failure["success"] is False
+    assert safe_failure["safe_to_retry"] is True
+    assert actor.poisoned is False
+    assert download_waits == 0
+
+    fail_actionability = False
+    with pytest.raises(BrowserActorPoisonedError, match="终态不确定"):
+        actor._action_sync(
+            "download",
+            lambda: actor._download_op("report"),
+            "report",
+        )
+    assert download_waits == 1
+    assert actor.poisoned is True
     actor._closed = True
     actor._executor.shutdown(wait=True, cancel_futures=True)
 
@@ -919,6 +1183,47 @@ def test_internal_failure_after_mutation_dispatch_poisons_actor(tmp_path) -> Non
 
     with pytest.raises(BrowserActorPoisonedError, match="终态不确定"):
         actor._action_sync("click", fail_after_dispatch, None)
+    assert actor.poisoned is True
+    actor._closed = True
+    actor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_failure_after_actionability_trial_still_poisons_actor(tmp_path) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    actor = BrowserActor("http://127.0.0.1:9", tmp_path, EvidenceStore())
+    calls: list[bool] = []
+
+    class Locator:
+        def evaluate(self, expression: str) -> dict[str, object]:  # noqa: ARG002
+            return {"bid": "abc", "tag": "button", "type": "button", "text": "Open"}
+
+        def click(self, timeout: int, trial: bool = False) -> None:  # noqa: ARG002
+            calls.append(trial)
+            if not trial:
+                raise PlaywrightTimeoutError(
+                    "Locator.click: Timeout exceeded.\n"
+                    "- element is not visible\n"
+                    "- performing click action\n"
+                    "- waiting for scheduled navigations to finish"
+                )
+
+    page = SimpleNamespace(url="https://example.test", is_closed=lambda: False)
+    actor._owner_thread = threading.get_ident()
+    actor._connected = True
+    actor._page = page
+    actor._context = SimpleNamespace(pages=[page])
+    actor._locator = lambda bid: Locator()  # type: ignore[method-assign]
+    actor._semantic_page_state = lambda: {  # type: ignore[method-assign]
+        "url": page.url,
+        "title": "page",
+        "semantic_page_fingerprint": "same",
+        "semantic_element_count": 1,
+    }
+
+    with pytest.raises(BrowserActorPoisonedError, match="终态不确定"):
+        actor._action_sync("click", lambda: actor._click_op("abc"), "abc")
+    assert calls == [True, False]
     assert actor.poisoned is True
     actor._closed = True
     actor._executor.shutdown(wait=True, cancel_futures=True)

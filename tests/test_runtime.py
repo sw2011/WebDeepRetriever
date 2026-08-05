@@ -286,6 +286,98 @@ def test_relevant_body_flood_cannot_hide_visible_navigation_control() -> None:
     assert any(item["bid"] == "next" for item in projected["elements"])
 
 
+def test_task_relevant_input_value_is_searchable_for_projection() -> None:
+    elements = [
+        {
+            "bid": f"noise-{index}",
+            "tag": "button",
+            "text": f"{'Overview' if index % 2 else 'More'} {index}",
+            "visible": True,
+        }
+        for index in range(200)
+    ]
+    elements.append(
+        {
+            "bid": "submit-chart",
+            "tag": "input",
+            "type": "button",
+            "value": "View Chart",
+            "visible": False,
+        }
+    )
+    projected = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "report",
+            "dom_hash": "a",
+            "evidence_id": "ev-1",
+            "elements": elements,
+            "truncated": False,
+        },
+        "Select a period and View Chart",
+        unchanged=False,
+        max_elements=40,
+    )
+    assert any(item["bid"] == "submit-chart" for item in projected["elements"])
+
+    generic_action = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "report",
+            "dom_hash": "a",
+            "evidence_id": "ev-2",
+            "elements": elements,
+            "truncated": False,
+        },
+        "Find the plotted result",
+        unchanged=False,
+        max_elements=40,
+    )
+    assert any(item["bid"] == "submit-chart" for item in generic_action["elements"])
+
+
+def test_navigation_action_flood_cannot_hide_task_relevant_control() -> None:
+    elements = [
+        {"bid": f"more-{index}", "tag": "button", "text": "More", "visible": True}
+        for index in range(121)
+    ]
+    elements.append(
+        {"bid": "quarterly", "tag": "button", "text": "Quarterly chart", "visible": True}
+    )
+    projected = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "report",
+            "dom_hash": "a",
+            "evidence_id": "ev-1",
+            "elements": elements,
+            "truncated": False,
+        },
+        "Quarterly data",
+        unchanged=False,
+    )
+    assert any(item["bid"] == "quarterly" for item in projected["elements"])
+
+    primary_actions = [
+        {"bid": f"view-{index}", "tag": "button", "text": "View", "visible": True}
+        for index in range(121)
+    ]
+    primary_actions.append(elements[-1])
+    projected = _project_observation(
+        {
+            "url": "https://example.test",
+            "title": "report",
+            "dom_hash": "b",
+            "evidence_id": "ev-2",
+            "elements": primary_actions,
+            "truncated": False,
+        },
+        "Quarterly data",
+        unchanged=False,
+    )
+    assert any(item["bid"] == "quarterly" for item in projected["elements"])
+
+
 def test_projection_selects_by_priority_then_restores_dom_order() -> None:
     elements = [
         {"bid": "first", "tag": "p", "text": "intro", "visible": True},
@@ -552,6 +644,139 @@ async def test_no_progress_loop_stops_before_another_model_request() -> None:
             "system",
             [],
         )
+
+
+@pytest.mark.asyncio
+async def test_first_model_catalog_for_runtime_known_state_is_not_unchanged_compacted() -> None:
+    state_url = "https://example.test/form"
+    state_fingerprint = "new-state"
+    elements = [
+        {
+            "bid": f"target-{index}",
+            "tag": "button",
+            "text": f"Action {index}",
+            "visible": True,
+            "disabled": False,
+        }
+        for index in range(40)
+    ]
+
+    class CatalogActor(DummyActor):
+        task_generation = 1
+        poisoned = False
+
+        async def observe(self) -> dict[str, object]:
+            return {
+                "url": state_url,
+                "title": "form",
+                "dom_hash": "raw",
+                "semantic_page_fingerprint": state_fingerprint,
+                "evidence_id": "ev-observe",
+                "elements": elements,
+                "scroll": [],
+                "truncated": False,
+                "task_generation": self.task_generation,
+            }
+
+    context = make_context()
+    context.actor = CatalogActor()  # type: ignore[assignment]
+    context.current_url = "https://example.test/old"
+    context.current_semantic_fingerprint = "old-state"
+    context.latest_model_element_state = ("https://example.test/old", "old-state")
+    context.latest_model_elements = [{"bid": "old", "tag": "button"}]
+    context.record_call("click", {"bid": "next"})
+    context.record_tool_outcome(
+        "click",
+        {"bid": "next"},
+        {
+            "success": True,
+            "after_url": state_url,
+            "postconditions": {"after_semantic_page_fingerprint": state_fingerprint},
+        },
+    )
+    assert context.latest_model_elements == []
+    assert context.latest_model_element_state is None
+
+    tool = next(item for item in TOOLS if item.name == "observe")
+    first = json.loads(
+        await tool.on_invoke_tool(
+            ToolContext(context, tool_name="observe", tool_call_id="first", tool_arguments="{}"),
+            "{}",
+        )
+    )
+    assert first["unchanged"] is False
+    assert len(first["elements"]) == 40
+    assert any(item["bid"] == "target-39" for item in first["elements"])
+    assert context.latest_model_element_state == (state_url, state_fingerprint)
+
+    repeated = json.loads(
+        await tool.on_invoke_tool(
+            ToolContext(context, tool_name="observe", tool_call_id="second", tool_arguments="{}"),
+            "{}",
+        )
+    )
+    assert repeated["unchanged"] is True
+    assert len(repeated["elements"]) == 24
+    assert all(item["bid"] != "target-39" for item in repeated["elements"])
+
+
+@pytest.mark.asyncio
+async def test_returning_to_unobserved_prior_state_still_gets_full_catalog() -> None:
+    state_url = "https://example.test/a"
+    state_fingerprint = "state-a"
+    elements = [
+        {"bid": f"a-{index}", "tag": "button", "text": f"Action {index}", "visible": True}
+        for index in range(40)
+    ]
+
+    class CatalogActor(DummyActor):
+        task_generation = 1
+        poisoned = False
+
+        async def observe(self) -> dict[str, object]:
+            return {
+                "url": state_url,
+                "title": "page a",
+                "dom_hash": "raw-a",
+                "semantic_page_fingerprint": state_fingerprint,
+                "evidence_id": "ev-a",
+                "elements": elements,
+                "scroll": [],
+                "truncated": False,
+                "task_generation": self.task_generation,
+            }
+
+    context = make_context()
+    context.actor = CatalogActor()  # type: ignore[assignment]
+    context.current_url = state_url
+    context.current_semantic_fingerprint = state_fingerprint
+    context.latest_model_element_state = (state_url, state_fingerprint)
+    context.latest_model_elements = list(elements)
+
+    for url, fingerprint in (("https://example.test/b", "state-b"), (state_url, state_fingerprint)):
+        context.record_call("tabs", {"action": "switch", "index": 0})
+        context.record_tool_outcome(
+            "tabs",
+            {"action": "switch", "index": 0},
+            {
+                "ok": True,
+                "tabs": [{"index": 0, "url": url, "active": True}],
+                "semantic_page_fingerprint": fingerprint,
+            },
+        )
+
+    assert context.latest_model_elements == []
+    assert context.latest_model_element_state is None
+    tool = next(item for item in TOOLS if item.name == "observe")
+    observed = json.loads(
+        await tool.on_invoke_tool(
+            ToolContext(context, tool_name="observe", tool_call_id="observe-a", tool_arguments="{}"),
+            "{}",
+        )
+    )
+    assert observed["unchanged"] is False
+    assert len(observed["elements"]) == 40
+    assert any(item["bid"] == "a-39" for item in observed["elements"])
 
 
 @pytest.mark.asyncio
